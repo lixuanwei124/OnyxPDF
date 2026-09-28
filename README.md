@@ -15,7 +15,7 @@ OnyxPDF，国产一站式PDF阅览工具，支持文档编辑、多格式导出�
 - 跨会话持久化（localStorage，按文档指纹隔离）
 - **保存（Ctrl+S）写回原文件**、另存为（Ctrl+Shift+S）、导出含批注 PDF
 
-### 工具集（移植 PDFPatcher 核心能力，pdf-lib 本地实现）
+### 工具集（基于 pdf-lib 本地实现）
 | 工具 | 说明 |
 |---|---|
 | 合并 PDF | 多选文件按序合并 |
