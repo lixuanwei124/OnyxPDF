@@ -1,0 +1,618 @@
+import * as pdfjsLib from '../vendor/pdf.min.mjs';
+
+function glyphText(args) {
+  return (args || []).map(glyph => {
+    if (typeof glyph === 'number') return ' ';
+    return glyph?.unicode ?? glyph?.fontChar ?? '';
+  }).join('');
+}
+
+function colorByte(value) {
+  const number = Number(value) || 0;
+  return Math.max(0, Math.min(255, Math.round(number > 1 ? number : number * 255)));
+}
+
+function rgbHex(color) {
+  return '#' + color.map(colorByte).map(value => value.toString(16).padStart(2, '0')).join('');
+}
+
+function mapItemsToShowOperations(items, operations) {
+  const mapped = items.map(() => []);
+  const visibleTargets = [];
+  items.forEach((item, index) => {
+    if (String(item.str || '').replace(/\s+/g, '')) visibleTargets.push({ item, index });
+  });
+
+  let operationIndex = 0;
+  let operationCursor = 0;
+  for (const target of visibleTargets) {
+    const wanted = String(target.item.str || '').replace(/\s+/g, '');
+    let consumed = 0;
+    while (consumed < wanted.length && operationIndex < operations.length) {
+      const operation = operations[operationIndex];
+      const available = String(operation.text || '').replace(/\s+/g, '');
+      if (!available || operationCursor >= available.length) {
+        operationIndex++;
+        operationCursor = 0;
+        continue;
+      }
+      const take = Math.min(available.length - operationCursor, wanted.length - consumed);
+      if (take > 0) {
+        mapped[target.index].push(operation.index);
+        consumed += take;
+        operationCursor += take;
+      }
+      if (operationCursor >= available.length) {
+        operationIndex++;
+        operationCursor = 0;
+      }
+    }
+  }
+  return mapped;
+}
+
+function fontInfo(page, fontId) {
+  try {
+    const font = page.commonObjs.get(fontId);
+    const rawName = font?.name || font?.fallbackName || '';
+    const bold = /(?:Bold|Heavy|Black|Semib?old)|(?:^|[-_ ])Bd(?: |$|-)/i.test(rawName);
+    const name = rawName
+      .replace(/^[A-Z]{6}\+/, '')
+      .trim();
+    return {
+      name: name || null,
+      bold,
+      key: fontId,
+      data: font?.data instanceof Uint8Array ? font.data : null,
+      mimetype: font?.mimetype || null
+    };
+  } catch (_) {
+    return { name: null, bold: false, key: fontId, data: null, mimetype: null };
+  }
+}
+
+function appendRuns(output, incoming) {
+  for (const run of incoming) {
+    if (!run.text) continue;
+    const previous = output[output.length - 1];
+    const same = previous &&
+      previous.font === run.font &&
+      previous.fontKey === run.fontKey &&
+      Math.abs(previous.size - run.size) < 0.05 &&
+      previous.color === run.color &&
+      previous.bold === run.bold &&
+      !previous.sourceOps.length !== !run.sourceOps.length;
+    if (same && run.text !== ' ') {
+      previous.text += run.text;
+      previous.sourceOps.push(...run.sourceOps);
+    } else {
+      output.push({
+        text: run.text,
+        font: run.font || '微软雅黑',
+        fontKey: run.fontKey || null,
+        fontData: run.fontData || null,
+        size: Math.round((run.size || 12) * 10) / 10,
+        color: run.color || '#000000',
+        bold: !!run.bold,
+        sourceOps: [...(run.sourceOps || [])]
+      });
+    }
+  }
+  return output;
+}
+
+function weightedMedian(items) {
+  if (!items.length) return 12;
+  const sorted = [...items].sort((left, right) => left.value - right.value);
+  const totalWeight = sorted.reduce((sum, item) => sum + item.weight, 0);
+  let seen = 0;
+  for (const item of sorted) {
+    seen += item.weight;
+    if (seen >= totalWeight / 2) return item.value;
+  }
+  return sorted[sorted.length - 1].value;
+}
+
+function dominantRun(line) {
+  return [...line.runs].sort((left, right) => right.text.length - left.text.length)[0] || {};
+}
+
+function styleKey(line) {
+  const run = dominantRun(line);
+  return [
+    run.font || '',
+    Math.round((run.size || line.size) * 10) / 10,
+    run.color || '#000000',
+    run.bold ? 'bold' : 'regular'
+  ].join('|');
+}
+
+function isHeadingLine(line, bodySize) {
+  const run = dominantRun(line);
+  const text = line.text.trim();
+  return (run.size || line.size) >= bodySize * 1.12 ||
+    /^[一二三四五六七八九十]+[、.．]\s*\S{1,28}$/.test(text) ||
+    (run.bold && text.length <= 35 && !/[.。!！?？:：;；,，]$/.test(text));
+}
+
+function isItemStart(line) {
+  return /^([•·▪◦\u2022\u25CF\u25AA\u2013\-—*]|[一二三四五六七八九十]+[、.．]|\d+[.、)])\s*/u.test(line.text.trimStart());
+}
+
+function lineAlignment(line, pageWidth) {
+  const center = line.x + line.width / 2;
+  const leftMargin = line.x;
+  const rightMargin = Math.max(0, pageWidth - line.x - line.width);
+  const marginDifference = Math.abs(leftMargin - rightMargin);
+  const sizeUnit = Math.max(6, line.size);
+  if (line.width <= pageWidth * 0.68 &&
+    center > pageWidth * 0.32 && center < pageWidth * 0.68 && marginDifference <= sizeUnit * 1.6 &&
+    Math.min(leftMargin, rightMargin) >= Math.max(sizeUnit * 2, pageWidth * 0.09)) {
+    return 'center';
+  }
+  if (rightMargin <= sizeUnit && leftMargin >= Math.max(24, sizeUnit * 3)) return 'right';
+  return 'left';
+}
+
+function dominantAlignment(lines, pageWidth) {
+  const counts = { left: 0, center: 0, right: 0 };
+  for (const line of lines) counts[line.alignment || lineAlignment(line, pageWidth)] += line.text.length || 1;
+  return Object.entries(counts).sort((left, right) => right[1] - left[1])[0][0];
+}
+
+function canJoinLines(previous, current, bodySize, pageWidth) {
+  const previousRun = dominantRun(previous);
+  const currentRun = dominantRun(current);
+  const sizeRatio = current.size / previous.size;
+  if (sizeRatio < 0.86 || sizeRatio > 1.16) return false;
+  const changesDominantFont = (previousRun.font || '') !== (currentRun.font || '');
+  if ((previousRun.color || '') !== (currentRun.color || '')) return false;
+  if (!!previousRun.bold !== !!currentRun.bold) return false;
+
+  const gap = Math.abs(current.baseline - previous.baseline);
+  const expectedGap = Math.max(previous.lineHeight, current.lineHeight);
+  if (gap <= expectedGap * 0.55) return false;
+
+  if (lineAlignment(previous, pageWidth) !== lineAlignment(current, pageWidth)) return false;
+  const leftShift = current.x - previous.x;
+  const maxIndent = Math.max(current.size * 3.1, 18);
+  if (leftShift > maxIndent || leftShift < -current.size * 1.2) return false;
+
+  const previousText = previous.text.trimEnd();
+  const currentText = current.text.trimStart();
+  if (!previousText || !currentText) return false;
+  const paragraphEnd = /[.。!！?？]$/.test(previousText);
+  const bulletStart = /^([•·▪◦\u2022\u25CF\u25AA\u2013\-—*]|[一二三四五六七八九十]+[、.．]|\d+[.、)])\s*/u.test(currentText);
+  const wrappedEvidence = previous.width >= current.width * 0.72 &&
+    previous.width >= Math.max(bodySize * 18, 72);
+  if (changesDominantFont && !wrappedEvidence) return false;
+  const hasContinuationPunctuation = /[，、；,;:]$/.test(previousText);
+  const strongWrappedEvidence = wrappedEvidence && hasContinuationPunctuation;
+  const maximumGap = strongWrappedEvidence
+    ? Math.max(expectedGap * 3.2, Math.max(previous.size, current.size) * 4)
+    : Math.max(expectedGap * 1.75, Math.max(previous.size, current.size) * 2.5);
+  if (gap <= expectedGap * 0.55 || gap > maximumGap) return false;
+  if (paragraphEnd && gap > expectedGap * 1.18 && !strongWrappedEvidence) return false;
+  if (bulletStart && (current.x - previous.x > current.size * 0.8 || gap > expectedGap * 1.18)) return false;
+  if (gap > expectedGap * 1.32 && !strongWrappedEvidence && /^[\p{Lu}]/u.test(currentText)) return false;
+  const shortStandaloneText = Math.max(previous.width, current.width) < bodySize * 23;
+  if (!wrappedEvidence && (!hasContinuationPunctuation || shortStandaloneText)) return false;
+  return true;
+}
+
+function joinLineRuns(lines) {
+  const runs = [];
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    const copied = line.runs.map(run => ({
+      ...run,
+      sourceOps: [...(run.sourceOps || [])]
+    }));
+    if (lineIndex > 0 && copied.length) {
+      const previousLine = lines[lineIndex - 1];
+      const expectedGap = Math.max(previousLine.lineHeight, line.lineHeight);
+      const preserveLineBreak = isItemStart(line) ||
+        line.baseline - previousLine.baseline > expectedGap * 1.32;
+      if (preserveLineBreak) {
+        appendRuns(runs, [{
+          ...copied[0],
+          text: '\n',
+          sourceOps: []
+        }]);
+      } else {
+        const left = previousLine.text.trimEnd().slice(-1) || '';
+        const right = copied[0].text.trimStart().slice(0, 1) || '';
+        const needsSpace = /[\p{L}\p{N},;:)\]}>%"'”’]/u.test(left) &&
+          /[\p{L}\p{N}(\[<{“‘]/u.test(right) &&
+          !/[\u2E80-\u9FFF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]/u.test(left + right);
+        if (needsSpace) appendRuns(runs, [{ ...copied[0], text: ' ' }]);
+      }
+    } else if (runs.length && copied.length) {
+      const previousLine = lines[lineIndex - 1];
+      const left = previousLine?.text.trimEnd().slice(-1) || '';
+      const right = copied[0].text.trimStart().slice(0, 1) || '';
+      const needsSpace = /[\p{L}\p{N},;:)\]}>%"'”’]/u.test(left) &&
+        /[\p{L}\p{N}(\[<{“‘]/u.test(right) &&
+        !/[\u2E80-\u9FFF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]/u.test(left + right);
+      if (needsSpace) appendRuns(runs, [{ ...copied[0], text: ' ' }]);
+    }
+    appendRuns(runs, copied);
+  }
+  return runs.map(run => ({
+    ...run,
+    sourceOps: [...new Set(run.sourceOps || [])].sort((left, right) => left - right)
+  }));
+}
+
+function buildParagraphBlocks(lines, pageWidth) {
+  const bodySize = weightedMedian(lines.flatMap(line =>
+    line.runs.map(run => ({
+      value: run.size,
+      weight: Math.min(Math.max(run.text.replace(/\s+/g, '').length, 1), 120)
+    }))
+  ));
+  const groups = [];
+  let current = [];
+
+  const flush = () => {
+    if (current.length) groups.push(current);
+    current = [];
+  };
+
+  for (const line of lines) {
+    if (!current.length) {
+      current = [line];
+      continue;
+    }
+    const previous = current[current.length - 1];
+    if (!isHeadingLine(previous, bodySize) && !isHeadingLine(line, bodySize) &&
+      canJoinLines(previous, line, bodySize, pageWidth)) {
+      current.push(line);
+    } else {
+      flush();
+      current = [line];
+    }
+  }
+  flush();
+
+  return groups.map((group, index) => {
+    const heading = group.length === 1 && isHeadingLine(group[0], bodySize);
+    const runs = joinLineRuns(group);
+    const left = Math.min(...group.map(line => line.x));
+    const right = Math.max(...group.map(line => line.x + line.width));
+    const gaps = group.slice(1).map((line, lineIndex) =>
+      Math.abs(line.baseline - group[lineIndex].baseline)
+    );
+    const measuredLineHeight = weightedMedian(gaps.map(gap => ({ value: gap, weight: 1 })));
+    const maxHeight = Math.max(...group.map(line => Math.max(...line.runs.map(run => run.size), line.size)));
+    const lineHeight = Math.min(Math.max(
+      group.length > 1 && measuredLineHeight > maxHeight * 0.9 ? measuredLineHeight : maxHeight * 1.22,
+      maxHeight * 0.95
+    ), maxHeight * 1.85);
+    const sourceOps = [...new Set(group.flatMap(line => line.sourceOps))]
+      .filter(Number.isInteger).sort((leftValue, rightValue) => leftValue - rightValue);
+
+    return {
+      id: `P${index}`,
+      kind: heading ? 'heading' : 'paragraph',
+      lineCount: group.length,
+      x: group[0].x,
+      baseline: group[0].baseline,
+      width: Math.max(right - group[0].x, Math.max(...group.map(line => line.width)), 1),
+      size: Math.round(maxHeight * 10) / 10,
+      lineHeight: Math.round(lineHeight * 10) / 10,
+      originalLineHeight: Math.round(lineHeight * 10) / 10,
+      height: Math.max((group[0].baseline - group[group.length - 1].baseline) + maxHeight * 1.22, maxHeight * 1.22),
+      ascent: 0.82,
+      runs,
+      exportLines: group.map(line => ({
+        x: line.x,
+        baseline: line.baseline,
+        width: line.width,
+        size: line.size,
+        runs: line.runs.map(run => ({ ...run, sourceOps: [...(run.sourceOps || [])] })),
+        cells: (line.cells || []).map(cell => ({
+          ...cell,
+          runs: cell.runs.map(run => ({ ...run, sourceOps: [...(run.sourceOps || [])] }))
+        }))
+      })),
+      sourceLineRuns: group.map(line => line.runs.map(run => ({
+        ...run,
+        sourceOps: [...run.sourceOps]
+      }))),
+      sourceOps,
+      alignment: dominantAlignment(group, pageWidth),
+      text: runs.map(run => run.text).join('').replace(/\n/g, ''),
+      sourceLines: group.map(line => ({ id: line.id, text: line.text }))
+    };
+  });
+}
+
+function normalizedText(value) {
+  return String(value || '').replace(/[\s\-—–·•.,。、;；:：!！?？'"()（）[\]{}]/gu, '');
+}
+
+export function splitRawLine(rawLine) {
+  const segments = [];
+  let current = [];
+  for (const fragment of rawLine) {
+    if (!current.length) {
+      current = [fragment];
+      continue;
+    }
+    const previous = current[current.length - 1];
+    const gap = fragment.x - (previous.x + previous.width);
+    const size = Math.max(previous.size, fragment.size);
+    if (gap > Math.max(size * 1.8, 12)) {
+      segments.push(current);
+      current = [fragment];
+    } else {
+      current.push(fragment);
+    }
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+export async function extractContentPage(pdfDocument, pageNumber) {
+  const page = await pdfDocument.getPage(pageNumber);
+  const pageViewport = page.getViewport({ scale: 1 });
+  const textContent = await page.getTextContent();
+
+  const operations = [];
+  const fillColors = [];
+  try {
+    const operatorList = await page.getOperatorList();
+    const OPS = pdfjsLib.OPS;
+    let fill = [0, 0, 0];
+    for (let index = 0; index < operatorList.fnArray.length; index++) {
+      const fn = operatorList.fnArray[index];
+      const args = operatorList.argsArray[index];
+      if (fn === OPS.setFillRGBColor) fill = Array.from(args, colorByte);
+      else if (fn === OPS.setFillCMYKColor) {
+        const [cyan, magenta, yellow, black] = args;
+        fill = [
+          (1 - cyan) * (1 - black),
+          (1 - magenta) * (1 - black),
+          (1 - yellow) * (1 - black)
+        ].map(value => Math.round(value * 255));
+      } else if (fn === OPS.setFillGray) {
+        const gray = Math.round(args[0] * 255);
+        fill = [gray, gray, gray];
+      } else if (fn === OPS.showText || fn === OPS.showSpacedText) {
+        operations.push({
+          index: operations.length,
+          text: glyphText(args?.[0]),
+          color: rgbHex(fill)
+        });
+      }
+    }
+  } catch (error) {
+    if (import.meta.env?.DEV) console.warn('PDF 颜色解析失败', error);
+  }
+  fillColors.length = 0;
+
+  const itemOperations = mapItemsToShowOperations(textContent.items, operations);
+  const isHorizontal = item =>
+    Math.hypot(item.transform[1], item.transform[2]) <=
+    Math.hypot(item.transform[0], item.transform[3]) * 0.035;
+  const horizontalItemIndices = new Set(textContent.items
+    .map((item, index) => isHorizontal(item) ? index : -1)
+    .filter(index => index >= 0));
+  const fragments = [];
+  textContent.items.forEach((item, itemIndex) => {
+    if (!item.str || !item.str.trim() || !horizontalItemIndices.has(itemIndex)) return;
+    const size = Math.hypot(item.transform[2], item.transform[3]) ||
+      Math.abs(item.transform[3]) || 10;
+    const sourceOperations = [...new Set(itemOperations[itemIndex] || [])]
+      .filter(Number.isInteger).sort((left, right) => left - right);
+    fragments.push({
+      x: item.transform[4],
+      baseline: item.transform[5],
+      width: item.width || 0,
+      height: item.height || size,
+      size,
+      rotated: !isHorizontal(item),
+      text: item.str,
+      font: fontInfo(page, item.fontName),
+      color: operations[itemOperations[itemIndex]?.[0]]?.color || '#000000',
+      sourceOps: sourceOperations
+    });
+  });
+
+  fragments.sort((left, right) => left.baseline - right.baseline || left.x - right.x);
+  const rawLines = [];
+  let currentLine = [];
+  for (const fragment of fragments) {
+    const reference = currentLine[0];
+    const tolerance = Math.max(reference?.size || fragment.size, fragment.size) * 0.45;
+    if (reference && Math.abs(fragment.baseline - reference.baseline) <= tolerance) {
+      currentLine.push(fragment);
+    } else {
+      if (currentLine.length) rawLines.push(currentLine);
+      currentLine = [fragment];
+    }
+  }
+  if (currentLine.length) rawLines.push(currentLine);
+
+  const lines = [];
+  for (const rawLine of rawLines) {
+    rawLine.sort((left, right) => left.x - right.x);
+    for (const lineFragments of splitRawLine(rawLine)) {
+      const runs = [];
+      let previousRight = null;
+      for (const fragment of lineFragments) {
+        if (previousRight !== null && fragment.x - previousRight > fragment.size * 0.18) {
+          appendRuns(runs, [{
+            text: ' ',
+            font: fragment.font.name || '微软雅黑',
+            fontKey: fragment.font.key,
+            fontData: fragment.font.data,
+            size: fragment.size,
+            color: fragment.color,
+            bold: fragment.font.bold,
+            sourceOps: []
+          }]);
+        }
+        appendRuns(runs, [{
+          text: fragment.text,
+          font: fragment.font.name || '微软雅黑',
+          fontKey: fragment.font.key,
+          fontData: fragment.font.data,
+          size: fragment.size,
+          color: fragment.color,
+          bold: fragment.font.bold,
+          sourceOps: fragment.sourceOps
+        }]);
+        previousRight = fragment.x + fragment.width;
+      }
+      while (runs.length && !runs[runs.length - 1].text.trim()) runs.pop();
+      if (!runs.length) continue;
+
+      const left = Math.min(...lineFragments.map(item => item.x));
+      const right = Math.max(...lineFragments.map(item => item.x + item.width));
+      const size = Math.max(...lineFragments.map(item => item.size));
+      const baseline = lineFragments[0].baseline;
+      const sourceOps = [...new Set(lineFragments.flatMap(item => item.sourceOps))]
+        .filter(Number.isInteger).sort((leftValue, rightValue) => leftValue - rightValue);
+      const id = `L${lines.length}`;
+      const cells = [lineFragments].map(lineFragmentGroup => {
+        const cellRuns = [];
+        let cellPreviousRight = null;
+        for (const fragment of lineFragmentGroup) {
+          if (cellPreviousRight !== null && fragment.x - cellPreviousRight > fragment.size * 0.18) {
+            cellRuns.push({
+              text: ' ',
+              font: fragment.font.name || '微软雅黑',
+              fontKey: fragment.font.key,
+              fontData: fragment.font.data,
+              size: fragment.size,
+              color: fragment.color,
+              bold: fragment.font.bold,
+              sourceOps: []
+            });
+          }
+          cellRuns.push({
+            text: fragment.text,
+            font: fragment.font.name || '微软雅黑',
+            fontKey: fragment.font.key,
+            fontData: fragment.font.data,
+            size: fragment.size,
+            color: fragment.color,
+            bold: fragment.font.bold,
+            sourceOps: [...fragment.sourceOps]
+          });
+          cellPreviousRight = fragment.x + fragment.width;
+        }
+        while (cellRuns.length && !cellRuns[cellRuns.length - 1].text.trim()) cellRuns.pop();
+        if (!cellRuns.length) return null;
+        const cellLeft = Math.min(...lineFragmentGroup.map(item => item.x));
+        const cellRight = Math.max(...lineFragmentGroup.map(item => item.x + item.width));
+        return {
+          x: cellLeft,
+          baseline: lineFragmentGroup[0].baseline,
+          width: Math.max(cellRight - cellLeft, 1),
+          size: Math.max(...lineFragmentGroup.map(item => item.size)),
+          text: cellRuns.map(run => run.text).join(''),
+          runs: cellRuns
+        };
+      }).filter(Boolean);
+      lines.push({
+        id,
+        kind: 'line',
+        x: left,
+        baseline,
+        width: Math.max(right - left, 1),
+        size: Math.round(size * 10) / 10,
+        lineHeight: Math.round(size * 1.22 * 10) / 10,
+        ascent: 0.82,
+        runs,
+        cells,
+        sourceLineRuns: [runs.map(run => ({ ...run, sourceOps: [...run.sourceOps] }))],
+        sourceOps,
+        text: runs.map(run => run.text).join('')
+      });
+    }
+  }
+  lines.sort((left, right) => right.baseline - left.baseline || left.x - right.x);
+
+  const blocks = buildParagraphBlocks(lines, pageViewport.width);
+  return {
+    pageNumber,
+    width: pageViewport.width,
+    height: pageViewport.height,
+    sourceTextCount: textContent.items.length,
+    nativeBlocks: blocks,
+    nativeLines: lines,
+    blocks
+  };
+}
+
+export function applySavedEdits(pageModel, savedEdits) {
+  const editMap = new Map((savedEdits || []).map(edit => [edit.blockKey, edit]));
+  for (const block of [...(pageModel.nativeBlocks || pageModel.blocks || []), ...(pageModel.nativeLines || [])]) {
+    const saved = editMap.get(block.id);
+    if (saved?.engine !== 2 || !Array.isArray(saved.runs)) continue;
+    block.runs = saved.runs.map(run => ({ ...run, sourceOps: [...block.sourceOps] }));
+    block.text = block.runs.map(run => run.text).join('');
+    block.sourceLineRuns = [block.runs.map(run => ({ ...run, sourceOps: [...run.sourceOps] }))];
+    const blockSize = Number(block.size) || Number(block.runs?.[0]?.size) || 12;
+    block.exportLines = [{
+      x: Number(block.x) || 0,
+      baseline: Number(block.baseline) || 0,
+      width: Math.max(Number(block.width) || 1, 1),
+      size: blockSize,
+      runs: block.runs.map(run => ({ ...run, sourceOps: [...(run.sourceOps || [])] })),
+      cells: [{
+        x: Number(block.x) || 0,
+        baseline: Number(block.baseline) || 0,
+        width: Math.max(Number(block.width) || 1, 1),
+        size: blockSize,
+        text: block.text,
+        runs: block.runs.map(run => ({ ...run, sourceOps: [...(run.sourceOps || [])] }))
+      }]
+    }];
+    block.savedEdit = true;
+  }
+  return buildContentViews(pageModel);
+}
+
+export function buildContentViews(pageModel) {
+  const lines = pageModel.nativeLines || [];
+  const paragraphs = pageModel.nativeBlocks || pageModel.blocks || [];
+  const allRuns = joinLineRuns(lines);
+  const sourceOps = [...new Set(lines.flatMap(line => line.sourceOps))]
+    .filter(Number.isInteger).sort((left, right) => left - right);
+  const left = Math.min(...lines.map(line => line.x));
+  const right = Math.max(...lines.map(line => line.x + line.width));
+  const size = Math.max(...lines.map(line => Math.max(...line.runs.map(run => run.size), line.size)));
+  const gaps = lines.slice(1).map((line, index) => line.baseline - lines[index].baseline)
+    .filter(gap => gap > 0);
+  const measuredLineHeight = weightedMedian(gaps.map(gap => ({ value: gap, weight: 1 })));
+  const word = {
+    id: 'WORD',
+    kind: 'word',
+    lineCount: lines.length,
+    x: left,
+    baseline: Math.max(...lines.map(line => line.baseline)),
+    width: Math.max(right - left, 1),
+    size: Math.round(size * 10) / 10,
+    lineHeight: Math.round((measuredLineHeight || size * 1.22) * 10) / 10,
+    height: Math.max(Math.max(...lines.map(line => line.baseline)) - Math.min(...lines.map(line => line.baseline)) + size * 1.22, size * 1.22),
+    ascent: 0.82,
+    runs: allRuns,
+    sourceLineRuns: lines.map(line => line.runs.map(run => ({ ...run, sourceOps: [...run.sourceOps] }))),
+    sourceOps,
+    alignment: 'left',
+    text: allRuns.map(run => run.text).join('')
+  };
+  pageModel.blocks = paragraphs;
+  pageModel.views = {
+    paragraph: paragraphs,
+    line: lines,
+    word: [word]
+  };
+  pageModel.mode = pageModel.mode || 'paragraph';
+  pageModel.activeBlocks = pageModel.views[pageModel.mode] || paragraphs;
+  return pageModel;
+}

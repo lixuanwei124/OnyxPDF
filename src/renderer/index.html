@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'" />
+  <title>OnyxPDF</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body data-tool="select">
+
+  <!-- ══════════ 标题栏 ══════════ -->
+  <header id="titlebar">
+    <div class="tb-brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <polygon points="12,2 22,20 2,20" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <circle cx="12" cy="14.5" r="3.2" fill="currentColor"/>
+      </svg>
+      <span class="brand-name">ONYX<em>PDF</em></span>
+    </div>
+    <div class="tb-title" id="tb-file-title">未打开文档</div>
+    <div class="tb-controls">
+      <button id="btn-win-min" class="win-btn" title="最小化" aria-label="最小化">
+        <svg viewBox="0 0 12 12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+      <button id="btn-win-max" class="win-btn" title="最大化" aria-label="最大化">
+        <svg viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+      <button id="btn-win-close" class="win-btn win-close" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 12 12"><line x1="2.5" y1="2.5" x2="9.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/><line x1="9.5" y1="2.5" x2="2.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ══════════ 菜单栏 ══════════ -->
+  <nav id="menubar" aria-label="菜单栏">
+    <button class="menu-item" data-menu="file">文件
+      <svg class="caret" viewBox="0 0 8 8"><path d="M1 2.5 4 5.5 7 2.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+    <button class="menu-item" data-menu="tools">工具
+      <svg class="caret" viewBox="0 0 8 8"><path d="M1 2.5 4 5.5 7 2.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+    <button class="menu-item" data-menu="help">帮助
+      <svg class="caret" viewBox="0 0 8 8"><path d="M1 2.5 4 5.5 7 2.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+  </nav>
+  <div id="menu-layer"></div>
+
+  <!-- ══════════ 标签页栏 ══════════ -->
+  <nav id="tabbar" aria-label="文档标签页"></nav>
+
+  <!-- ══════════ 工具栏 ══════════ -->
+  <nav id="toolbar" role="toolbar" aria-label="主工具栏">
+    <div class="tool-group">
+      <button class="tl-btn" id="btn-open" title="打开 PDF (Ctrl+O)" aria-label="打开 PDF">
+        <svg viewBox="0 0 20 20"><path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h3.6l2 2h5.4A1.5 1.5 0 0 1 17 6.5v8A1.5 1.5 0 0 1 15.5 16h-11A1.5 1.5 0 0 1 3 14.5z" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>打开</span>
+      </button>
+      <button class="tl-btn" id="btn-export" title="导出含批注的 PDF" aria-label="导出含批注的 PDF">
+        <svg viewBox="0 0 20 20"><path d="M10 3v9M6.5 8.5 10 12l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4 14v2.2A.8.8 0 0 0 4.8 17h10.4a.8.8 0 0 0 .8-.8V14" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>导出</span>
+      </button>
+      <button class="tl-btn" id="btn-print" title="打印 (Ctrl+P)" aria-label="打印">
+        <svg viewBox="0 0 20 20"><path d="M6 7V3h8v4M6 13H3.8A.8.8 0 0 1 3 12.2V8.8A1.8 1.8 0 0 1 4.8 7h10.4A1.8 1.8 0 0 1 17 8.8v3.4a.8.8 0 0 1-.8.8H14" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="6" y="11.5" width="8" height="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>打印</span>
+      </button>
+    </div>
+
+    <span class="tool-sep" aria-hidden="true"></span>
+
+    <div class="tool-group" role="radiogroup" aria-label="批注工具">
+      <button class="tl-btn tool-toggle" data-tool="select" aria-pressed="true" title="选择 / 滚动 (V)">
+        <svg viewBox="0 0 20 20"><path d="M5 3l10 6.2-4.4 1L13 15.6 10.8 16.6 8.5 11 5 13.6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        <span>选择</span>
+      </button>
+      <button class="tl-btn tool-toggle" data-tool="highlight" aria-pressed="false" title="高亮（先选中文本）(H)">
+        <svg viewBox="0 0 20 20"><rect x="4" y="4" width="12" height="5" rx="1" fill="currentColor" opacity=".55"/><path d="M4 12h12M4 15h7" stroke="currentColor" stroke-width="1.3"/></svg>
+        <span>高亮</span>
+      </button>
+      <button class="tl-btn tool-toggle" data-tool="underline" aria-pressed="false" title="下划线（先选中文本）(U)">
+        <svg viewBox="0 0 20 20"><path d="M5 4v5.5a5 5 0 0 0 10 0V4" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="4" y1="16" x2="16" y2="16" stroke="currentColor" stroke-width="1.6"/></svg>
+        <span>下划线</span>
+      </button>
+      <button class="tl-btn tool-toggle" data-tool="rect" aria-pressed="false" title="矩形标注 (R)">
+        <svg viewBox="0 0 20 20"><rect x="3.5" y="4.5" width="13" height="11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="3 2"/></svg>
+        <span>矩形</span>
+      </button>
+      <button class="tl-btn" id="btn-edit-mode" aria-pressed="false" title="编辑内容：点击文字块原位修改；拖选部分文字可单独调整字体、字号、颜色和粗细">
+        <svg viewBox="0 0 20 20"><path d="M3 17h14M5 13l9.5-9.5a1.4 1.4 0 0 1 2 0l0 0a1.4 1.4 0 0 1 0 2L7 15l-4 1z" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>编辑内容</span>
+      </button>
+      <button class="tl-btn hidden" id="btn-insert-image" title="在点击位置插入图片">
+        <svg viewBox="0 0 20 20"><rect x="3" y="3.5" width="14" height="13" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="7.2" cy="8" r="1.5" fill="currentColor"/><path d="M3.5 14.5 8 10l3 3 2.5-2.5 3 3" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>插图片</span>
+      </button>
+      <button class="tl-btn tool-toggle" data-tool="note" aria-pressed="false" title="便签 (N)">
+        <svg viewBox="0 0 20 20"><path d="M4 4h12v9l-3 3H4z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M13 16v-3h3" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>便签</span>
+      </button>
+      <button class="tl-btn" id="btn-clear-annot" title="清除本页批注" aria-label="清除本页批注">
+        <svg viewBox="0 0 20 20"><path d="M4 6h12M8 6V4.5A.5.5 0 0 1 8.5 4h3a.5.5 0 0 1 .5.5V6M6 6l.8 9.2a1 1 0 0 0 1 .8h4.4a1 1 0 0 0 1-.8L14 6" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>
+        <span>清除</span>
+      </button>
+    </div>
+
+    <span class="tool-sep" aria-hidden="true"></span>
+
+    <div class="tool-group">
+      <button class="tl-btn tl-icon" id="btn-zoom-out" title="缩小 (Ctrl+-)" aria-label="缩小">
+        <svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="13.5" y1="13.5" x2="17" y2="17" stroke="currentColor" stroke-width="1.4"/><line x1="6.5" y1="9" x2="11.5" y2="9" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+      <button class="tl-btn tl-text" id="btn-fit-width" title="适合宽度 (W)">适宽</button>
+      <button class="tl-btn tl-text" id="btn-fit-page" title="适合页面 (F)">适页</button>
+      <button class="tl-btn tl-icon" id="btn-zoom-in" title="放大 (Ctrl++)" aria-label="放大">
+        <svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="13.5" y1="13.5" x2="17" y2="17" stroke="currentColor" stroke-width="1.4"/><line x1="6.5" y1="9" x2="11.5" y2="9" stroke="currentColor" stroke-width="1.4"/><line x1="9" y1="6.5" x2="9" y2="11.5" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+      <button class="tl-btn tl-icon" id="btn-rotate" title="顺时针旋转 90°" aria-label="旋转">
+        <svg viewBox="0 0 20 20"><path d="M5 9a6 6 0 1 1 1.8 4.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 13.6V9h4.6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+    </div>
+
+    <div class="tool-spring" aria-hidden="true"></div>
+
+    <div class="tool-group">
+      <button class="tl-btn" id="btn-search" title="全文检索 (Ctrl+F)" aria-label="全文检索">
+        <svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="13.5" y1="13.5" x2="17" y2="17" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>检索</span>
+      </button>
+      <button class="tl-btn tl-icon" id="btn-sidebar" title="侧栏（缩略图 / 书签）(S)" aria-label="侧栏">
+        <svg viewBox="0 0 20 20"><rect x="3" y="3.5" width="14" height="13" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="8" y1="3.5" x2="8" y2="16.5" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ══════════ 主体 ══════════ -->
+  <div id="main">
+    <aside id="sidebar" class="hidden" aria-label="侧栏">
+      <div class="side-tabs" role="tablist">
+        <button class="side-tab active" data-tab="thumbs" role="tab">缩略图</button>
+        <button class="side-tab" data-tab="outline" role="tab">书签</button>
+        <button class="side-tab" data-tab="search" role="tab">检索</button>
+      </div>
+      <div class="side-panel" id="panel-thumbs" role="tabpanel"></div>
+      <div class="side-panel hidden" id="panel-outline" role="tabpanel"></div>
+      <div class="side-panel hidden" id="panel-search" role="tabpanel">
+        <div class="search-box">
+          <input id="search-input" type="text" placeholder="输入关键词…" spellcheck="false" />
+          <div class="search-nav">
+            <button id="search-prev" title="上一处">↑</button>
+            <span id="search-count" class="mono">0/0</span>
+            <button id="search-next" title="下一处">↓</button>
+          </div>
+        </div>
+        <div id="search-results"></div>
+      </div>
+    </aside>
+
+    <section id="viewer-wrap">
+      <!-- 欢迎页 -->
+      <div id="welcome">
+        <div class="w-mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <polygon points="12,2 22,20 2,20" fill="none" stroke="currentColor" stroke-width="1.2"/>
+            <circle cx="12" cy="14.5" r="3.2" fill="currentColor"/>
+          </svg>
+        </div>
+        <h1>ONYX<em>PDF</em></h1>
+        <p class="w-sub">玄瑙Onxy，轻松掌握每一页</p>
+        <button id="btn-open-welcome" class="w-open">打开 PDF 文档</button>
+        <p class="w-drop">或将文件拖入本窗口</p>
+        <div class="w-recents">
+          <div class="w-recents-head">
+            <span>最近打开</span>
+            <button id="btn-recents-clear" class="link-btn">清空</button>
+          </div>
+          <ul id="recents-list"></ul>
+        </div>
+      </div>
+
+      <!-- 文档视图 -->
+      <div id="viewer" class="hidden" tabindex="0"></div>
+      <div id="drag-mask" class="hidden"><div class="drag-inner">释放以打开 PDF</div></div>
+    </section>
+  </div>
+
+  <!-- ══════════ 状态栏 ══════════ -->
+  <footer id="statusbar">
+    <span id="st-tool" class="st-chip mono">SELECT</span>
+    <span id="st-page" class="mono">– / –</span>
+    <span id="st-zoom" class="mono">100%</span>
+    <span class="st-spring"></span>
+    <span id="st-file" class="mono"></span>
+  </footer>
+
+  <!-- 便签编辑弹层 -->
+  <div id="note-editor" class="hidden">
+    <div class="ne-head">便签<button id="note-del" class="link-btn danger">删除</button></div>
+    <textarea id="note-text" placeholder="输入注释内容…" spellcheck="false"></textarea>
+    <div class="ne-foot">
+      <button id="note-save" class="ne-btn primary">保存</button>
+      <button id="note-cancel" class="ne-btn">取消</button>
+    </div>
+  </div>
+
+  <input type="file" id="img-file-input" accept="image/png,image/jpeg" class="hidden" />
+
+  <!-- 模态对话框容器（工具 / 关于） -->
+  <div id="modal-mask" class="hidden"></div>
+
+  <!-- Toast -->
+  <div id="toast" class="hidden"></div>
+
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script src="vendor/fontkit.umd.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
