@@ -1078,6 +1078,7 @@ async function doAbout() {
         <div class="a-desc">
           OnyxPDF，国产一站式PDF阅览工具，支持文档编辑、多格式导出，高效处理PDF文档。
         </div>
+        <div class="a-author">作者：Friday（周五王）</div>
       </div>
     `,
     buttons: [{ label: '确定', primary: true, onClick: (m) => m.close() }]

@@ -869,6 +869,7 @@ body[data-tool="note"] #st-tool { color: var(--magenta); border-color: #d94f8c55
 .about-body h2 em { font-style: normal; color: var(--accent); }
 .about-body .a-ver { margin-top: 4px; color: var(--dim); font-size: 12px; }
 .about-body .a-desc { margin-top: 10px; color: var(--dim); font-size: 12px; line-height: 1.7; }
+.about-body .a-author { margin-top: 14px; color: var(--dim); font-size: 11px; }
 
 /* ─────────── Toast ─────────── */
 #toast {
