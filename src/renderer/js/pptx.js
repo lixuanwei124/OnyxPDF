@@ -155,10 +155,11 @@ export function buildPptxEditable(pageData) {
       for (const run of block.runs || []) {
         const font = exportFontForRun(run.font, page.embeddedFonts);
         if (!font?.bytes?.length) continue;
-        const group = fontGroups.get(font.family) || { regular: null, bold: null, italic: null };
+        const family = displayFontName(font.family);
+        const group = fontGroups.get(family) || { regular: null, bold: null, italic: null };
         const slot = font.italic ? 'italic' : font.bold ? 'bold' : 'regular';
         if (!group[slot] || font.bytes.length > group[slot].bytes.length) group[slot] = font;
-        fontGroups.set(font.family, group);
+        fontGroups.set(family, group);
       }
     }
   }
@@ -254,6 +255,40 @@ fontRelationships.join('') +
     if (rgb) return rgb.slice(1).map(item => Number(item).toString(16).padStart(2, '0')).join('').toUpperCase();
     return String(value || '#000000').replace('#', '').padEnd(6, '0').slice(0, 6).toUpperCase();
   };
+  function displayFontName(value) {
+    let font = String(value || '')
+      .replace(/^[A-Z]{6}\+/, '')
+      .replace(/["']/g, '')
+      .replace(/[-_ ]?(?:Regular|Bold|Italic|Oblique|Light|Medium)$/i, '')
+      .replace(/(?:Regular|Bold|Italic|Oblique|Light|Medium)$/i, '')
+      .trim();
+    const aliases = {
+      'MicrosoftYaHei': 'Microsoft YaHei',
+      'MicrosoftYaHeiUI': 'Microsoft YaHei UI',
+      'KaiTi_GB2312': 'KaiTi',
+      '楷体_GB2312': 'KaiTi',
+      'Helvetica': 'Arial',
+      'ArialMT': 'Arial',
+      'Arial-BoldMT': 'Arial',
+      'Arial-BoldItalicMT': 'Arial',
+      'Arial-ItalicMT': 'Arial',
+      'TimesNewRomanPSMT': 'Times New Roman',
+      'TimesNewRomanPS-BoldMT': 'Times New Roman',
+      'TimesNewRomanPS-ItalicMT': 'Times New Roman',
+      'TimesNewRomanPS-BoldItalicMT': 'Times New Roman',
+      'TimesNewRoman-BoldMT': 'Times New Roman',
+      'TimesNewRoman-ItalicMT': 'Times New Roman',
+      'TimesNewRoman-BoldItalicMT': 'Times New Roman',
+      'CourierNewPSMT': 'Courier New',
+      'CourierNewPS-BoldMT': 'Courier New',
+      'CourierNewPS-ItalicMT': 'Courier New',
+      'CourierNewPS-BoldItalicMT': 'Courier New',
+      'CourierNew-BoldMT': 'Courier New',
+      'CourierNew-ItalicMT': 'Courier New',
+      'Wingdings-Regular': 'Wingdings'
+    };
+    return aliases[font] || aliases[font.replace(/[-_ ]/g, '')] || font || 'Microsoft YaHei';
+  }
   const textLines = (runs) => {
     const lines = [[]];
     for (const run of runs || []) {
@@ -265,29 +300,97 @@ fontRelationships.join('') +
     }
     return lines;
   };
+  const substitutionMeasureContext = typeof document === 'undefined'
+    ? null
+    : document.createElement('canvas').getContext('2d');
+  const substitutionSpacingXml = (run, fontName, size) => {
+    if (!substitutionMeasureContext || !run.text || !Number.isFinite(Number(run.width))) return '';
+    const declaredWidth = Number(run.width);
+    if (declaredWidth <= 0) return '';
+    substitutionMeasureContext.font =
+      `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${size}px "${fontName}"`;
+    const substitutedWidth = substitutionMeasureContext.measureText(run.text).width;
+    const tolerance = Math.max(0.5, declaredWidth * 0.04);
+    if (Math.abs(declaredWidth - substitutedWidth) <= tolerance) return '';
+    const spacing = Math.max(-3000, Math.min(5000, Math.round(
+      (declaredWidth - substitutedWidth) / Math.max(1, run.text.length) * 100
+    )));
+    return ` spc="${spacing}"`;
+  };
   const richParagraphXml = (block, page) => {
     const alignment = block.alignment === 'center' ? 'ctr' : block.alignment === 'right' ? 'r' : 'l';
     const spacing = Math.round((Number(block.lineHeight) || Number(block.size) * 1.22 || 14) * 100);
-    const sourceLines = block.savedEdit || !Array.isArray(block.sourceLineRuns) || !block.sourceLineRuns.length
+    let sourceLines = block.savedEdit || !Array.isArray(block.sourceLineRuns) || !block.sourceLineRuns.length
       ? textLines(block.runs)
       : block.sourceLineRuns;
-    const runXml = (run) => {
+    normalizeSeparatorRunColors(sourceLines);
+    if (isVerticalTextBlock(block)) {
+      const verticalLines = [];
+      for (const lineRuns of sourceLines) {
+        for (const run of lineRuns) {
+          for (const character of Array.from(String(run.text || ''))) {
+            if (!/\S/.test(character)) continue;
+            verticalLines.push([{ ...run, text: character }]);
+          }
+        }
+      }
+      sourceLines = verticalLines;
+    }
+    const lineSpacingOverrides = sourceLines.map((lineRuns, lineIndex) => {
+      if (!substitutionMeasureContext || lineRuns.length < 2 || isVerticalTextBlock(block)) return null;
+      const declaredWidth = lineRuns.reduce((total, run) => total + (Number(run.width) || 0), 0);
+      const substitutedWidth = lineRuns.reduce((total, run) => {
+        const font = displayFontName(String(run.font || '').split(',')[0]
+          .replace(/^[A-Z]{6}\+/, '').replace(/["']/g, '').trim());
+        substitutionMeasureContext.font =
+          `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${Number(run.size) || Number(block.size) || 12}px "${font}"`;
+        return total + substitutionMeasureContext.measureText(run.text || '').width;
+      }, 0);
+      const characterCount = Math.max(1, lineRuns.reduce((total, run) =>
+        total + String(run.text || '').length, 0));
+      if (declaredWidth <= 0 || substitutedWidth <= declaredWidth * 1.04) return null;
+      const overflowRatio = substitutedWidth / declaredWidth;
+      if (overflowRatio < 1.08 || Number(block.x) + declaredWidth < Number(page.width) * 0.92) return null;
+      return ` spc="${Math.max(-3000, Math.round((declaredWidth - substitutedWidth) / characterCount * 100))}"`;
+    });
+    const runXml = (run, runLineIndex) => {
       const embeddedFont = exportFontForRun(run.font, page?.embeddedFonts);
       const font = embeddedFont?.family ||
         String(run.font || '').split(',')[0].replace(/^[A-Z]{6}\+/, '').replace(/["']/g, '').trim() || 'Microsoft YaHei';
-      const size = Math.max(100, Math.min(4000, Math.round((Number(run.size) || Number(block.size) || 12) * 100)));
+      const displayFont = displayFontName(font);
+      const size = Math.max(100, Math.min(400000, Math.round((Number(run.size) || Number(block.size) || 12) * 100)));
+      const substitutionSpacing = embeddedFont || isVerticalTextBlock(block) ? '' :
+        lineSpacingOverrides[runLineIndex] ?? substitutionSpacingXml(run, displayFont, size / 100);
       return '<a:r><a:rPr lang="zh-CN" altLang="en-US" sz="' + size + '"' +
+        substitutionSpacing +
         (run.bold ? ' b="1"' : '') + (run.italic ? ' i="1"' : '') + ' dirty="0">' +
         '<a:solidFill><a:srgbClr val="' + pptxColor(run.color) + '"/></a:solidFill>' +
-        '<a:latin typeface="' + xmlText(font) + '"/><a:ea typeface="' + xmlText(font) + '"/>' +
+        '<a:latin typeface="' + xmlText(displayFont) + '"/><a:ea typeface="' + xmlText(displayFont) + '"/>' +
         (run.underline ? '<a:uSng/>' : '') + '</a:rPr><a:t>' + xmlText(run.text) + '</a:t></a:r>';
     };
     const content = sourceLines.map((lineRuns, lineIndex) =>
-      (lineIndex ? '<a:br/>' : '') + lineRuns.map(runXml).join('')
+      (lineIndex ? '<a:br/>' : '') + lineRuns.map(run => runXml(run, lineIndex)).join('')
     ).join('');
     return '<a:p><a:pPr algn="' + alignment + '"><a:lnSpc><a:spcPts val="' + spacing + '"/></a:lnSpc></a:pPr>' +
       content + '<a:endParaRPr lang="zh-CN" dirty="0"/></a:p>';
   };
+  const normalizeSeparatorRunColors = (lines) => {
+    const flatRuns = lines.flat();
+    flatRuns.forEach((run, index) => {
+      const text = String(run.text || '');
+      if (run.color?.toUpperCase() !== '#FFFFFF' || !/^[\s—–-]+$/.test(text)) return;
+      const neighbor = [flatRuns[index - 1], flatRuns[index + 1]]
+        .find(item => String(item?.text || '').trim() && item.color?.toUpperCase() !== '#FFFFFF');
+      if (neighbor) run.color = neighbor.color;
+    });
+  };
+  function isVerticalTextBlock(block) {
+    const characterCount = String(block.text || '').replace(/\s+/g, '').length;
+    const size = Number(block.size) || 12;
+    const runHeight = Number(block.runs?.[0]?.height) || Number(block.frameHeight) || 0;
+    return characterCount > 1 && Number(block.width) <= size * 1.05 &&
+      runHeight >= characterCount * size * 0.72;
+  }
   const pictureXml = (shapeId, name, relationshipId, x, y, width, height) =>
     '<p:pic><p:nvPicPr><p:cNvPr id="' + shapeId + '" name="' + xmlText(name) + '"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>' +
     '<p:blipFill><a:blip r:embed="' + relationshipId + '"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>' +
@@ -327,10 +430,27 @@ fontRelationships.join('') +
     if (Array.isArray(pg.paragraphs)) {
       if (pg.bgDataUrl) {
         const relationshipId = `rIdBg${n}`;
-        const mediaName = `background-${n}.png`;
+        const isJpeg = /^data:image\/jpe?g/i.test(pg.bgDataUrl || '');
+        const mediaName = `background-${n}.${isJpeg ? 'jpg' : 'png'}`;
         slideRelationships.push(`<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${mediaName}"/>`);
         slideMedia.push({ name: mediaName, data: dataUrlBytes(pg.bgDataUrl) });
         shapes += pictureXml(++shapeSequence, `PDF Background ${n}`, relationshipId, 0, 0, pg.width, pg.height);
+      }
+      if (pg.patchDataUrl) {
+        const relationshipId = `rIdPatch${n}`;
+        const mediaName = `text-patch-${n}.png`;
+        slideRelationships.push(`<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${mediaName}"/>`);
+        slideMedia.push({ name: mediaName, data: dataUrlBytes(pg.patchDataUrl) });
+        shapes += pictureXml(++shapeSequence, `PDF Text Patch ${n}`, relationshipId, 0, 0, pg.width, pg.height);
+      }
+      for (const cover of pg.coverShapes || []) {
+        shapeSequence++;
+        shapes += '<p:sp><p:nvSpPr><p:cNvPr id="' + shapeSequence + '" name="Text Cover ' + shapeSequence + '"/>' +
+          '<p:cNvSpPr/><p:nvPr/></p:nvSpPr>' +
+          '<p:spPr><a:xfrm><a:off x="' + Math.round(Number(cover.x) * EMU) + '" y="' + Math.round(Number(cover.y) * EMU) + '"/>' +
+          '<a:ext cx="' + Math.round(Number(cover.width) * EMU) + '" cy="' + Math.round(Number(cover.height) * EMU) + '"/></a:xfrm>' +
+          '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="' + String(cover.color || '#FFFFFF').replace('#', '').toUpperCase() + '"/></a:solidFill>' +
+          '<a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>';
       }
       for (const image of pg.images || []) {
         shapeSequence++;
@@ -343,21 +463,40 @@ fontRelationships.join('') +
           Number(image.x), Number(pg.height) - Number(image.y) - Number(image.h), Number(image.w), Number(image.h));
       }
       for (const block of pg.paragraphs || []) {
-        shapeSequence++;
-        const left = Math.max(0, Number(block.x) || 0);
-        const top = Math.max(0, Number(block.top) || 0);
-        const originalWidth = Math.max(12, Number(block.width) || 48);
+      shapeSequence++;
+      const top = Math.max(0, Number(block.top) || 0);
+      const originalWidth = Math.max(12, Number(block.width) || 48);
+      const isVertical = isVerticalTextBlock(block);
+      const verticalShapeWidth = isVertical
+        ? Math.max(originalWidth, (Number(block.size) || 12) * 1.12)
+        : 0;
+      const left = Math.max(0, isVertical
+        ? Math.min(
+            Math.max(0, Number(pg.width) - verticalShapeWidth),
+            (Number(block.x) || 0) - (verticalShapeWidth - originalWidth) / 2
+          )
+        : Number(block.x) || 0);
         const tolerance = Math.max(2, originalWidth * 0.015, (Number(block.size) || 12) * 0.25);
         const width = Math.max(12, Math.min(
           Number(pg.width) - left,
           (Number(block.lineCount) || 1) === 1 ? originalWidth : originalWidth + tolerance
         ));
-        const height = Math.max(10, Number(block.frameHeight) || Number(block.lineHeight) || Number(block.size) * 1.22 || 14);
+        const isSingleLine = !isVertical && (Number(block.lineCount) || 1) === 1;
+        const singleLineAscent = Number(block.size) * 0.18;
+        const shapeTop = isSingleLine ? Math.max(0, top - singleLineAscent) : top;
+        const verticalCharacterCount = isVertical
+          ? String(block.text || '').replace(/\s+/g, '').length : 0;
+        const height = Math.max(10,
+          verticalCharacterCount
+            ? verticalCharacterCount * Number(block.size) * 1.2
+            : Number(block.frameHeight) || Number(block.lineHeight) || Number(block.size) * 1.22 || 14);
+        const shapeWidth = isVertical ? verticalShapeWidth : width;
         shapes += '<p:sp><p:nvSpPr><p:cNvPr id="' + shapeSequence + '" name="Paragraph ' + shapeSequence + '"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>' +
-          '<p:spPr><a:xfrm><a:off x="' + Math.round(left * EMU) + '" y="' + Math.round(top * EMU) + '"/>' +
-          '<a:ext cx="' + Math.round(width * EMU) + '" cy="' + Math.round(height * EMU) + '"/></a:xfrm>' +
+          '<p:spPr><a:xfrm><a:off x="' + Math.round(left * EMU) + '" y="' + Math.round(shapeTop * EMU) + '"/>' +
+          '<a:ext cx="' + Math.round(shapeWidth * EMU) + '" cy="' + Math.round(height * EMU) + '"/></a:xfrm>' +
           '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>' +
-          '<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" rtlCol="0"><a:noAutofit/></a:bodyPr><a:lstStyle/>' +
+          '<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" rtlCol="0"' +
+          '><a:noAutofit/></a:bodyPr><a:lstStyle/>' +
           richParagraphXml(block, pg) + '</p:txBody></p:sp>';
       }
     } else {

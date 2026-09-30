@@ -123,5 +123,27 @@ export async function extractEmbeddedFonts(bytes, PDFLib, fontkit) {
 
 export function exportFontForRun(font, embeddedFonts) {
   const key = cleanBaseFont(font).toLowerCase();
-  return embeddedFonts?.byAlias?.get(key) || null;
+  const candidate = embeddedFonts?.byAlias?.get(key) || null;
+  return hasUnicodeCharacterMap(candidate?.bytes) ? candidate : null;
+}
+
+function hasUnicodeCharacterMap(bytes) {
+  if (!bytes || bytes.length < 12) return false;
+  const view = bytes instanceof ArrayBuffer ? new DataView(bytes) : new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const sfntVersion = view.getUint32(0);
+  if (sfntVersion !== 0x00010000 &&
+    sfntVersion !== 0x4F54544F &&
+    sfntVersion !== 0x74727565) return false;
+  const tableCount = view.getUint16(4);
+  if (tableCount <= 0 || tableCount > 512 || bytes.length < 12 + tableCount * 16) return false;
+
+  let hasName = false;
+  let hasCmap = false;
+  for (let index = 0; index < tableCount; index++) {
+    const offset = 12 + index * 16;
+    const tag = view.getUint32(offset);
+    if (tag === 0x636D6170) hasCmap = true;
+    if (tag === 0x6E616D65) hasName = true;
+  }
+  return hasName && hasCmap;
 }

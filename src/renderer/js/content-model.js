@@ -51,6 +51,131 @@ function mapItemsToShowOperations(items, operations) {
   return mapped;
 }
 
+function colorDistance(left, right) {
+  return Math.hypot(left[0] - right[0], left[1] - right[1], left[2] - right[2]);
+}
+
+function parseHexColor(value) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(String(value || ''));
+  if (!match) return [0, 0, 0];
+  return [0, 2, 4].map(offset => parseInt(match[1].slice(offset, offset + 2), 16));
+}
+
+function rgbValue(color) {
+  return '#' + color.map(value => Math.max(0, Math.min(255, Math.round(value)))
+    .toString(16).padStart(2, '0')).join('');
+}
+
+async function analyzeRenderedTextItems(page, items, desiredColors = []) {
+  const appearance = items.map(item => item?.str?.trim() ? { visible: true, color: null } : null);
+  const pageViewport = page.getViewport({ scale: 1 });
+  const scale = Math.min(2, 2200 / Math.max(pageViewport.width, 1));
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  try {
+    await page.render({ canvasContext: context, viewport }).promise;
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const pixels = image.data;
+    items.forEach((item, itemIndex) => {
+      if (!appearance[itemIndex] || !item.width) return;
+      const size = Math.hypot(item.transform[2], item.transform[3]) ||
+        Math.abs(item.transform[3]) || item.height || 10;
+      const height = Math.max(item.height || size, size);
+      const pdfTop = item.transform[5] + height * 0.98;
+      const pdfBottom = item.transform[5] - height * 0.32;
+      const x0 = Math.max(0, Math.floor(item.transform[4] * scale) - 2);
+      const x1 = Math.min(canvas.width - 1,
+        Math.ceil((item.transform[4] + item.width) * scale) + 2);
+      const y0 = Math.max(0, Math.floor((pageViewport.height - pdfTop) * scale) - 2);
+      const y1 = Math.min(canvas.height - 1,
+        Math.ceil((pageViewport.height - pdfBottom) * scale) + 2);
+      if (x1 <= x0 || y1 <= y0) {
+        appearance[itemIndex].visible = false;
+        return;
+      }
+
+      const buckets = new Map();
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const offset = (y * canvas.width + x) * 4;
+          const color = [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
+          const key = ((color[0] >> 3) << 10) | ((color[1] >> 3) << 5) | (color[2] >> 3);
+          const bucket = buckets.get(key);
+          if (bucket) {
+            bucket.count++;
+            bucket.sum[0] += color[0];
+            bucket.sum[1] += color[1];
+            bucket.sum[2] += color[2];
+          } else {
+            buckets.set(key, { count: 1, sum: [...color] });
+          }
+        }
+      }
+      const samples = [...buckets.values()]
+        .map(bucket => ({
+          count: bucket.count,
+          color: bucket.sum.map(value => value / bucket.count)
+        }))
+        .sort((left, right) => right.count - left.count);
+      if (!samples.length) {
+        appearance[itemIndex].visible = false;
+        return;
+      }
+
+      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const minimumCount = Math.max(2, Math.round(area * 0.0008));
+      const desired = parseHexColor(desiredColors[itemIndex]);
+      const backgroundSamples = desired
+        ? samples.filter(sample => colorDistance(sample.color, desired) > 48)
+        : samples;
+      const background = backgroundSamples[0] || samples[0];
+
+      let desiredPixelCount = 0;
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const offset = (y * canvas.width + x) * 4;
+          const pixel = [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
+          if (colorDistance(pixel, desired) <= 72) desiredPixelCount++;
+        }
+      }
+
+      const desiredContrast = colorDistance(desired, background.color);
+      const sampledForeground = samples.slice(1)
+        .filter(sample => sample.count >= minimumCount &&
+          colorDistance(sample.color, background.color) >= 48)
+        .sort((left, right) =>
+          colorDistance(right.color, background.color) * Math.log(right.count + 1) -
+          colorDistance(left.color, background.color) * Math.log(left.count + 1))[0];
+      const operatorMatches = desiredPixelCount >= minimumCount && desiredContrast >= 48 &&
+        (!sampledForeground ||
+          desiredContrast + 12 >= colorDistance(sampledForeground.color, background.color));
+      let foreground = operatorMatches
+        ? { count: desiredPixelCount, color: desired }
+        : sampledForeground;
+      if (!operatorMatches && !foreground) {
+        foreground = samples.slice(1)
+          .filter(sample => sample.count >= minimumCount &&
+            colorDistance(sample.color, background.color) >= 34)
+          .sort((left, right) =>
+            colorDistance(right.color, background.color) * Math.sqrt(right.count) -
+            colorDistance(left.color, background.color) * Math.sqrt(left.count))[0];
+      }
+      appearance[itemIndex].visible = Boolean(foreground);
+      appearance[itemIndex].color = foreground ? rgbValue(foreground.color) : null;
+      appearance[itemIndex].operatorMatches = Boolean(foreground && operatorMatches);
+    });
+  } catch (error) {
+    if (import.meta.env?.DEV) console.warn('PDF 文本外观采样失败', error);
+  } finally {
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+  return appearance;
+}
+
 function fontInfo(page, fontId) {
   try {
     const font = page.commonObjs.get(fontId);
@@ -85,6 +210,16 @@ function appendRuns(output, incoming) {
     if (same && run.text !== ' ') {
       previous.text += run.text;
       previous.sourceOps.push(...run.sourceOps);
+      if (Number.isFinite(run.x) && Number.isFinite(previous.x)) {
+        previous.width = Math.max(
+          Number(previous.width) || 0,
+          run.x + (Number(run.width) || 0) - previous.x
+        );
+      }
+      if (Number.isFinite(run.baseline)) previous.baseline = run.baseline;
+      if (Number.isFinite(run.height)) {
+        previous.height = Math.max(Number(previous.height) || 0, run.height);
+      }
     } else {
       output.push({
         text: run.text,
@@ -94,6 +229,10 @@ function appendRuns(output, incoming) {
         size: Math.round((run.size || 12) * 10) / 10,
         color: run.color || '#000000',
         bold: !!run.bold,
+        x: Number.isFinite(run.x) ? run.x : undefined,
+        baseline: Number.isFinite(run.baseline) ? run.baseline : undefined,
+        width: Number.isFinite(run.width) ? run.width : undefined,
+        height: Number.isFinite(run.height) ? run.height : undefined,
         sourceOps: [...(run.sourceOps || [])]
       });
     }
@@ -332,6 +471,75 @@ function normalizedText(value) {
   return String(value || '').replace(/[\s\-—–·•.,。、;；:：!！?？'"()（）[\]{}]/gu, '');
 }
 
+function walkStructureNodes(nodes, callback) {
+  for (const node of nodes || []) {
+    if (node?.bbox) callback(node);
+    walkStructureNodes(node?.children, callback);
+  }
+}
+
+function structureSemanticText(node) {
+  const alt = String(node?.alt || '');
+  const separator = alt.lastIndexOf('\r\n');
+  const text = separator >= 0 ? alt.slice(separator + 2).trim() : '';
+  return text && !/^\([^()]{1,30}\)$/.test(text) ? text.replace(/\s+/g, ' ') : '';
+}
+
+function markedContentId(node) {
+  const ids = [];
+  const visit = (current) => {
+    const match = /(?:^|[-_])mc(\d+)$/.exec(String(current?.id || ''));
+    if (match) ids.push(Number(match[1]));
+    for (const child of current?.children || []) visit(child);
+  };
+  visit(node);
+  return ids;
+}
+
+function fragmentMatchesStructureText(fragment, text, rectangle) {
+  const overlapWidth = Math.min(fragment.x + fragment.width, rectangle[2]) -
+    Math.max(fragment.x, rectangle[0]);
+  const overlapHeight = Math.min(fragment.baseline + fragment.height, rectangle[3]) -
+    Math.max(fragment.baseline, rectangle[1]);
+  const overlapArea = Math.max(0, overlapWidth) * Math.max(0, overlapHeight);
+  const structureArea = Math.max(1, (rectangle[2] - rectangle[0]) * (rectangle[3] - rectangle[1]));
+  const fragmentArea = Math.max(1, fragment.width * fragment.height);
+  const sourceText = normalizedText(fragment.text).slice(0, 32);
+  return overlapArea / Math.min(structureArea, fragmentArea) > 0.32 &&
+    normalizedText(text).includes(sourceText);
+}
+
+async function collectStructureText(page, fragments) {
+  const nodes = [];
+  const structureTree = await page.getStructTree?.();
+  walkStructureNodes(structureTree?.children, node => {
+  const text = structureSemanticText(node);
+    if (text && Array.isArray(node.bbox) && node.bbox.length === 4) nodes.push({ node, text });
+  });
+  const missing = nodes.filter(({ node, text }) =>
+    !fragments.some(fragment => fragmentMatchesStructureText(fragment, text, node.bbox)));
+  const items = missing.map(({ node, text }) => {
+    const [x0, y0, x1, y1] = node.bbox;
+    const width = Math.max(1, x1 - x0);
+    const height = Math.max(1, y1 - y0);
+    const size = Math.min(Math.max(height * 0.76, 5), 300);
+    const isCJK = /[\u2E80-\u9FFF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]/.test(text);
+    return {
+      str: text,
+      width,
+      height,
+      transform: [size, 0, 0, size, x0, y0 + height * 0.18],
+      fontName: null,
+      structureFigure: true,
+      structureFontName: isCJK ? '微软雅黑' : 'Arial'
+    };
+  });
+  return {
+    items,
+    ids: [...new Set(nodes.flatMap(({ node }) => markedContentId(node)))]
+  };
+}
+
 export function splitRawLine(rawLine) {
   const segments = [];
   let current = [];
@@ -342,8 +550,21 @@ export function splitRawLine(rawLine) {
     }
     const previous = current[current.length - 1];
     const gap = fragment.x - (previous.x + previous.width);
-    const size = Math.max(previous.size, fragment.size);
-    if (gap > Math.max(size * 1.8, 12)) {
+    const size = Math.min(previous.size, fragment.size);
+    const sizeRatio = Math.max(previous.size, fragment.size) / size;
+    const mixedSizeGap = size * 1.45;
+    const structuralSizeBreak = sizeRatio > 1.16 && gap >= size * 0.24;
+    const structuralColorBreak = previous.color !== fragment.color &&
+      sizeRatio > 1.16 && gap >= size * 0.16;
+    const previousEndsCJK = /[\u2E80-\u9FFF\uF900-\uFAFF]/u.test(
+      String(previous.text || '').trimEnd().slice(-1)
+    );
+    const fragmentStartsSpacedCJK = /^\s+[\u2E80-\u9FFF\uF900-\uFAFF]/u.test(
+      String(fragment.text || '')
+    );
+    const tableCellBreak = previousEndsCJK && fragmentStartsSpacedCJK;
+    if (gap > Math.max(mixedSizeGap, 10) || structuralSizeBreak ||
+      structuralColorBreak || tableCellBreak) {
       segments.push(current);
       current = [fragment];
     } else {
@@ -360,15 +581,25 @@ export async function extractContentPage(pdfDocument, pageNumber) {
   const textContent = await page.getTextContent();
 
   const operations = [];
-  const fillColors = [];
+  let stroke = [0, 0, 0];
   try {
     const operatorList = await page.getOperatorList();
     const OPS = pdfjsLib.OPS;
     let fill = [0, 0, 0];
+    let renderMode = 0;
+    const graphicsStateStack = [];
     for (let index = 0; index < operatorList.fnArray.length; index++) {
       const fn = operatorList.fnArray[index];
       const args = operatorList.argsArray[index];
-      if (fn === OPS.setFillRGBColor) fill = Array.from(args, colorByte);
+      if (fn === OPS.save) {
+        graphicsStateStack.push({ fill: [...fill], stroke: [...stroke], renderMode });
+      } else if (fn === OPS.restore) {
+        const savedState = graphicsStateStack.pop();
+        if (savedState) ({ fill, stroke, renderMode } = savedState);
+      } else if (fn === OPS.setFillRGBColor) fill = Array.from(args, colorByte);
+      else if (fn === OPS.setStrokeRGBColor) stroke = Array.from(args, colorByte);
+      else if (fn === OPS.setFillColor) fill = Array.from(args, colorByte);
+      else if (fn === OPS.setStrokeColor) stroke = Array.from(args, colorByte);
       else if (fn === OPS.setFillCMYKColor) {
         const [cyan, magenta, yellow, black] = args;
         fill = [
@@ -379,26 +610,73 @@ export async function extractContentPage(pdfDocument, pageNumber) {
       } else if (fn === OPS.setFillGray) {
         const gray = Math.round(args[0] * 255);
         fill = [gray, gray, gray];
-      } else if (fn === OPS.showText || fn === OPS.showSpacedText) {
+      } else if (fn === OPS.setStrokeGray) {
+        const gray = Math.round(args[0] * 255);
+        stroke = [gray, gray, gray];
+      } else if (fn === OPS.setStrokeCMYKColor) {
+        const [cyan, magenta, yellow, black] = args;
+        stroke = [
+          (1 - cyan) * (1 - black),
+          (1 - magenta) * (1 - black),
+          (1 - yellow) * (1 - black)
+        ].map(value => Math.round(value * 255));
+      } else if (fn === OPS.setTextRenderingMode) {
+        renderMode = Number(args?.[0]) || 0;
+      } else if (
+        fn === OPS.showText || fn === OPS.showSpacedText ||
+        fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText
+      ) {
         operations.push({
           index: operations.length,
-          text: glyphText(args?.[0]),
-          color: rgbHex(fill)
+          text: glyphText(fn === OPS.nextLineSetSpacingShowText ? args?.[2] : args?.[0]),
+          color: rgbHex(fill),
+          stroke: rgbHex(stroke),
+          renderMode
         });
       }
     }
   } catch (error) {
     if (import.meta.env?.DEV) console.warn('PDF 颜色解析失败', error);
   }
-  fillColors.length = 0;
 
   const itemOperations = mapItemsToShowOperations(textContent.items, operations);
+  const effectiveColor = (operation, appearance) => {
+    if (!operation) return '#000000';
+    const outlineModes = new Set([1, 2, 5, 6]);
+    const whiteFill = operation.color === '#FFFFFF';
+    const visibleStroke = operation.stroke && operation.stroke !== '#FFFFFF';
+    let color = outlineModes.has(operation.renderMode) || (whiteFill && visibleStroke)
+      ? operation.stroke
+      : operation.color;
+    const renderedColor = appearance?.color;
+    if (renderedColor && appearance?.operatorMatches === false && renderedColor !== color) {
+      color = renderedColor;
+    }
+    return color;
+  };
   const isHorizontal = item =>
     Math.hypot(item.transform[1], item.transform[2]) <=
     Math.hypot(item.transform[0], item.transform[3]) * 0.035;
   const horizontalItemIndices = new Set(textContent.items
     .map((item, index) => isHorizontal(item) ? index : -1)
     .filter(index => index >= 0));
+  const preliminaryFragments = [];
+  textContent.items.forEach((item, itemIndex) => {
+    if (!item.str || !item.str.trim() || !horizontalItemIndices.has(itemIndex)) return;
+    const size = Math.hypot(item.transform[2], item.transform[3]) ||
+      Math.abs(item.transform[3]) || 10;
+    preliminaryFragments.push({
+      x: item.transform[4],
+      baseline: item.transform[5],
+      width: item.width || 0,
+      height: item.height || size,
+      text: item.str
+    });
+  });
+  const structureText = await collectStructureText(page, preliminaryFragments);
+  const allAppearanceItems = textContent.items.concat(structureText.items);
+  const renderedAppearance = await analyzeRenderedTextItems(
+    page, allAppearanceItems, itemOperations.map(indices => operations[indices?.[0]]?.color));
   const fragments = [];
   textContent.items.forEach((item, itemIndex) => {
     if (!item.str || !item.str.trim() || !horizontalItemIndices.has(itemIndex)) return;
@@ -406,6 +684,14 @@ export async function extractContentPage(pdfDocument, pageNumber) {
       Math.abs(item.transform[3]) || 10;
     const sourceOperations = [...new Set(itemOperations[itemIndex] || [])]
       .filter(Number.isInteger).sort((left, right) => left - right);
+    const sourceRenderModes = sourceOperations.map(operationIndex => operations[operationIndex]?.renderMode);
+    const syntheticBold = sourceOperations.some(operationIndex => {
+      const operation = operations[operationIndex];
+      return [2, 5].includes(operation?.renderMode) && operation?.stroke === operation?.color;
+    });
+    if (sourceRenderModes.length && sourceRenderModes.every(mode => mode === 3 || mode === 7)) return;
+    const appearance = renderedAppearance[itemIndex];
+    if (appearance && !appearance.visible) return;
     fragments.push({
       x: item.transform[4],
       baseline: item.transform[5],
@@ -414,9 +700,29 @@ export async function extractContentPage(pdfDocument, pageNumber) {
       size,
       rotated: !isHorizontal(item),
       text: item.str,
-      font: fontInfo(page, item.fontName),
-      color: operations[itemOperations[itemIndex]?.[0]]?.color || '#000000',
+      font: { ...fontInfo(page, item.fontName), bold: fontInfo(page, item.fontName).bold || syntheticBold },
+      color: effectiveColor(operations[itemOperations[itemIndex]?.[0]], appearance) ||
+        appearance?.color || '#000000',
       sourceOps: sourceOperations
+    });
+  });
+
+  structureText.items.forEach((item, offset) => {
+    const appearance = renderedAppearance[textContent.items.length + offset];
+    if (!appearance?.visible) return;
+    const size = Math.hypot(item.transform[2], item.transform[3]);
+    const fontName = item.structureFontName;
+    fragments.push({
+      x: item.transform[4],
+      baseline: item.transform[5],
+      width: item.width,
+      height: item.height,
+      size,
+      rotated: false,
+      text: item.str,
+      font: { name: fontName, bold: false, key: null, data: null },
+      color: appearance.color || '#161616',
+      sourceOps: []
     });
   });
 
@@ -451,6 +757,10 @@ export async function extractContentPage(pdfDocument, pageNumber) {
             size: fragment.size,
             color: fragment.color,
             bold: fragment.font.bold,
+            x: previousRight,
+            baseline: fragment.baseline,
+            width: Math.max(fragment.x - previousRight, 0),
+            height: fragment.height,
             sourceOps: []
           }]);
         }
@@ -462,6 +772,10 @@ export async function extractContentPage(pdfDocument, pageNumber) {
           size: fragment.size,
           color: fragment.color,
           bold: fragment.font.bold,
+          x: fragment.x,
+          baseline: fragment.baseline,
+          width: fragment.width || 0,
+          height: fragment.height,
           sourceOps: fragment.sourceOps
         }]);
         previousRight = fragment.x + fragment.width;
@@ -489,6 +803,10 @@ export async function extractContentPage(pdfDocument, pageNumber) {
               size: fragment.size,
               color: fragment.color,
               bold: fragment.font.bold,
+              x: cellPreviousRight,
+              baseline: fragment.baseline,
+              width: Math.max(fragment.x - cellPreviousRight, 0),
+              height: fragment.height,
               sourceOps: []
             });
           }
@@ -500,6 +818,10 @@ export async function extractContentPage(pdfDocument, pageNumber) {
             size: fragment.size,
             color: fragment.color,
             bold: fragment.font.bold,
+            x: fragment.x,
+            baseline: fragment.baseline,
+            width: fragment.width || 0,
+            height: fragment.height,
             sourceOps: [...fragment.sourceOps]
           });
           cellPreviousRight = fragment.x + fragment.width;
@@ -542,6 +864,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
     width: pageViewport.width,
     height: pageViewport.height,
     sourceTextCount: textContent.items.length,
+    structureFigureIds: structureText.ids,
     nativeBlocks: blocks,
     nativeLines: lines,
     blocks

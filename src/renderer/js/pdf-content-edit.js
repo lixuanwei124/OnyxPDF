@@ -162,7 +162,7 @@ function processStream(pdfLib, ref, stream, resources, removeOps, state, seen) {
       const nameOperand = (op.operands || []).find(item => item.text.startsWith('/'));
       const formName = nameOperand ? nameOperand.text.slice(1) : null;
       const xobjects = lookupDict(pdfLib, pdfLib ? pdfDocContext(resources) : null, resources.get(pdfLib.PDFName.of('XObject')));
-      const formRef = xobjects?.get(formName);
+      const formRef = formName ? xobjects?.get(pdfLib.PDFName.of(formName)) : null;
       const form = formRef ? pdfDocContext(resources).lookup(formRef) : null;
       const subtype = form?.dict?.get?.(pdfLib.PDFName.of('Subtype'))?.asString?.() || '';
       if (form && String(subtype).includes('Form')) {

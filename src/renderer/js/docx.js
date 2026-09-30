@@ -57,7 +57,7 @@ export function buildDocxParagraphLayout(pages) {
   const emu = (value) => Math.max(0, Math.round((Number(value) || 0) * EMU_PER_PT));
   let drawingSequence = 0;
 
-  const anchoredDrawing = ({ x = 0, y = 0, width, height, behindDoc = false, graphic }) => {
+  const anchoredDrawing = ({ x = 0, y = 0, width, height, behindDoc = false, graphic, name = 'Onyx Object' }) => {
     drawingSequence += 1;
     const relativeHeight = behindDoc ? drawingSequence : 100000 + drawingSequence;
     return '<w:r><w:drawing>' +
@@ -68,19 +68,19 @@ export function buildDocxParagraphLayout(pages) {
       `<wp:positionV relativeFrom="page"><wp:posOffset>${emu(y)}</wp:posOffset></wp:positionV>` +
       `<wp:extent cx="${emu(width)}" cy="${emu(height)}"/>` +
       '<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>' +
-      `<wp:docPr id="${drawingSequence}" name="Onyx Object ${drawingSequence}"/>` +
+      `<wp:docPr id="${drawingSequence}" name="${esc(name)} ${drawingSequence}"/>` +
       '<wp:cNvGraphicFramePr/>' +
       `<a:graphic><a:graphicData uri="${graphic.uri}">${graphic.xml}</a:graphicData></a:graphic>` +
       '</wp:anchor></w:drawing></w:r>';
   };
 
-  const pictureDrawing = ({ x, y, width, height, relationshipId, name }) => {
+  const pictureDrawing = ({ x, y, width, height, relationshipId, name, behindDoc }) => {
     return anchoredDrawing({
       x,
       y,
       width,
       height,
-      behindDoc: name.startsWith('PDF Background'),
+      behindDoc: behindDoc ?? name.startsWith('PDF Background'),
       graphic: {
         uri: 'http://schemas.openxmlformats.org/drawingml/2006/picture',
         xml: '<pic:pic>' +
@@ -114,6 +114,24 @@ export function buildDocxParagraphLayout(pages) {
     });
   };
 
+  const rectangleDrawing = ({ x, y, width, height, color, name }) => {
+    return anchoredDrawing({
+      x,
+      y,
+      width,
+      height,
+      graphic: {
+        uri: 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape',
+        xml: '<wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="0" y="0"/>' +
+          `<a:ext cx="${emu(width)}" cy="${emu(height)}"/></a:xfrm>` +
+          '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>' +
+          `<a:solidFill><a:srgbClr val="${esc(String(color || '#FFFFFF').replace('#', '').toUpperCase())}"/></a:solidFill>` +
+          '<a:ln><a:noFill/></a:ln></wps:spPr><wps:bodyPr/></wps:wsp>'
+      },
+      name
+    });
+  };
+
   const bodyParts = [];
   const mediaFiles = [];
   const relationships = [];
@@ -127,7 +145,8 @@ export function buildDocxParagraphLayout(pages) {
     if (page.bgDataUrl) {
       mediaSequence++;
       const relationshipId = `rIdBg${pageIndex + 1}`;
-      const mediaName = `media/bg${pageIndex + 1}.png`;
+      const isJpeg = /^data:image\/jpe?g/i.test(page.bgDataUrl || '');
+      const mediaName = `media/bg${pageIndex + 1}.${isJpeg ? 'jpg' : 'png'}`;
       relationships.push(`<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaName}"/>`);
       mediaFiles.push(imageBytes(page.bgDataUrl, `word/${mediaName}`));
       shapes.push(pictureDrawing({
@@ -137,6 +156,36 @@ export function buildDocxParagraphLayout(pages) {
         height: Number(page.height),
         relationshipId,
         name: `PDF Background ${pageIndex + 1}`
+      }));
+    }
+
+    if (page.patchDataUrl) {
+      mediaSequence++;
+      const relationshipId = `rIdPatch${pageIndex + 1}`;
+      const mediaName = `media/text-patch-${pageIndex + 1}.png`;
+      relationships.push(`<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaName}"/>`);
+      mediaFiles.push(imageBytes(page.patchDataUrl, `word/${mediaName}`));
+      shapes.push(pictureDrawing({
+        x: 0,
+        y: 0,
+        width: Number(page.width),
+        height: Number(page.height),
+        relationshipId,
+        name: `PDF Text Patch ${pageIndex + 1}`,
+        behindDoc: true
+      }));
+    }
+
+    let coverSequence = 0;
+    for (const cover of page.coverShapes || []) {
+      coverSequence++;
+      shapes.push(rectangleDrawing({
+        x: Number(cover.x),
+        y: Number(cover.y),
+        width: Number(cover.width),
+        height: Number(cover.height),
+        color: cover.color,
+        name: `PDF Text Cover ${pageIndex + 1}-${coverSequence}`
       }));
     }
 

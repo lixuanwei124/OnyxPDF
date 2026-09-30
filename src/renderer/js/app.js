@@ -18,8 +18,8 @@ import { buildXlsxLayout } from './xlsx.js';
 import { clamp, toast, escapeHtml, formatBytes, timeAgo } from './utils.js';
 import { extractPageLines, extractPageImages, extractPageRects } from './pdf2edit.js';
 import { extractContentPage, applySavedEdits } from './content-model.js';
-import { extractEmbeddedFonts } from './embedded-fonts.js';
 import { removeTextOperations } from './pdf-content-stream.js';
+import { extractEmbeddedFonts } from './embedded-fonts.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '../vendor/pdf.worker.min.mjs';
 
@@ -767,10 +767,54 @@ async function collectEditPages() {
 /** PPT 可编辑 v2（.pptx，段落文本框 + 原文图形背景，版式还原） */
 async function buildPptxEditableExportV2() {
   const pages = await buildParagraphExportPages();
+  await flattenParagraphExportBackgrounds(pages);
   return {
     bytes: buildPptxEditable(pages),
     suggestedName: state.fileName.replace(/\.pdf$/i, '') + '.pptx'
   };
+}
+
+async function flattenParagraphExportBackgrounds(pages) {
+  for (const page of pages) {
+    if (!page.bgDataUrl) continue;
+    const canvas = document.createElement('canvas');
+    const background = new Image();
+    const patch = new Image();
+    await Promise.all([
+      new Promise((resolve, reject) => {
+        background.onload = resolve;
+        background.onerror = () => reject(new Error('PPTX 背景解码失败'));
+        background.src = page.bgDataUrl;
+      }),
+      page.patchDataUrl ? new Promise((resolve, reject) => {
+        patch.onload = resolve;
+        patch.onerror = () => reject(new Error('PPTX 文字补丁解码失败'));
+        patch.src = page.patchDataUrl;
+      }) : Promise.resolve()
+    ]);
+    canvas.width = background.naturalWidth;
+    canvas.height = background.naturalHeight;
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(background, 0, 0);
+    if (page.patchDataUrl) context.drawImage(patch, 0, 0);
+    if (!page.patchDataUrl && page.coverShapes?.length) {
+      const backgroundScale = canvas.width / Number(page.width);
+      for (const cover of page.coverShapes) {
+        context.fillStyle = cover.color || '#FFFFFF';
+        context.fillRect(
+          Number(cover.x) * backgroundScale,
+          Number(cover.y) * backgroundScale,
+          Number(cover.width) * backgroundScale,
+          Number(cover.height) * backgroundScale
+        );
+      }
+    }
+    page.bgDataUrl = canvas.toDataURL('image/png');
+    delete page.patchDataUrl;
+    delete page.coverShapes;
+  }
 }
 
 async function buildPptxEditableExport() {
@@ -794,7 +838,6 @@ async function buildWordLayoutExport() {
 async function buildParagraphExportPages() {
   if (!viewer.doc) throw new Error('请先打开 PDF 文档');
   if (!state.originalBytes) throw new Error('原始 PDF 数据不可用');
-  if (!window.PDFLib?.PDFDocument) throw new Error('PDF 原文处理组件不可用');
 
   if (contentEditor.enabled) contentEditor.commitDom();
   const editsByPage = new Map();
@@ -809,34 +852,29 @@ async function buildParagraphExportPages() {
     cMapPacked: true,
     enableXfa: false
   }).promise;
-  const backgroundDocument = await window.PDFLib.PDFDocument.load(state.originalBytes.slice(0));
   const embeddedFonts = await extractEmbeddedFonts(
     state.originalBytes.slice(0), window.PDFLib, window.fontkit
   );
   const pages = [];
+  let textFreeDocument = null;
 
   try {
     for (let pageNumber = 1; pageNumber <= state.numPages; pageNumber++) {
       toast(`解析段落 ${pageNumber}/${state.numPages}…`);
       const model = await extractContentPage(sourceDocument, pageNumber);
+      const originalExportLines = new Map(model.blocks.map(block => [
+        block.id,
+        (block.exportLines || []).map(line => ({ ...line }))
+      ]));
       applySavedEdits(model, editsByPage.get(pageNumber) || []);
       const paragraphs = model.blocks.filter(block => block.runs?.some(run => run.text));
-
-      const sourceOperations = [...new Set(paragraphs.flatMap(block => block.sourceOps || []))]
-        .filter(Number.isInteger).sort((left, right) => left - right);
-      if (sourceOperations.length) {
-        try {
-          removeTextOperations(backgroundDocument, pageNumber - 1, sourceOperations, { all: false });
-        } catch (_) {
-          removeTextOperations(backgroundDocument, pageNumber - 1, [], { all: true });
-        }
-      }
 
       const imageList = contentEditor.images.get(pageNumber) || [];
       pages.push({
         paragraphs: paragraphs.map(block => ({
           ...block,
           runs: (block.runs || []).map(run => ({ ...run })),
+          sourceInpaintLines: originalExportLines.get(block.id) || [],
           sourceOps: [...(block.sourceOps || [])],
           top: paragraphTopPt(model, block),
           frameHeight: Math.max(
@@ -854,9 +892,16 @@ async function buildParagraphExportPages() {
       });
     }
 
-    const backgroundBytes = await backgroundDocument.save({ useObjectStreams: false });
-    const renderedDocument = await pdfjsLib.getDocument({
-      data: backgroundBytes.slice(0),
+    const sourceOperationsByPage = new Map(pages.map(page => [
+      page.pageNumber,
+      [...new Set(page.paragraphs.flatMap(paragraph => paragraph.sourceOps || []))]
+        .filter(Number.isInteger)
+        .sort((left, right) => left - right)
+    ]));
+    textFreeDocument = await pdfjsLib.getDocument({
+      data: await createTextFreeDocumentBytes(
+        state.originalBytes.slice(0), sourceOperationsByPage
+      ),
       cMapUrl: '../vendor/cmaps/',
       cMapPacked: true,
       enableXfa: false
@@ -864,13 +909,805 @@ async function buildParagraphExportPages() {
 
     for (const page of pages) {
       toast(`生成背景 ${page.pageNumber}/${state.numPages}…`);
-      page.bgDataUrl = await renderDocumentPageToDataUrl(renderedDocument, page.pageNumber, 2);
+      page.bgDataUrl = await renderAndInpaintPage(
+        sourceDocument, page.pageNumber, 2, page.paragraphs, textFreeDocument
+      );
+      page.patchDataUrl = null;
+      page.coverShapes = [];
     }
   } finally {
     await sourceDocument.cleanup?.();
+    await textFreeDocument.cleanup?.();
   }
 
   return pages;
+}
+
+/**
+ * 原文渲染保留图形和轮廓字；可见正文由局部擦除移除。
+ */
+async function createTextFreeDocumentBytes(sourceBytes, sourceOperationsByPage) {
+  const pdfDocument = await window.PDFLib.PDFDocument.load(sourceBytes, {
+    ignoreEncryption: true,
+    updateMetadata: false
+  });
+  for (let pageIndex = 0; pageIndex < pdfDocument.getPageCount(); pageIndex++) {
+    removeTextOperations(
+      pdfDocument,
+      pageIndex,
+      sourceOperationsByPage.get(pageIndex + 1) || []
+    );
+  }
+  return pdfDocument.save({ useObjectStreams: false });
+}
+
+/**
+ * 渲染原文背景，并只把“原文与无文字渲染”差异处的背景像素写入透明补丁。
+ * 相比矩形色块，这种方法不会破坏渐变、红底、表格和窄标签。
+ */
+async function renderPageBackgroundPatch(
+  originalDocument, textFreeDocument, pageNumber, scale = 2, paragraphs = []
+) {
+  const renderCanvas = async (pdfDocument) => {
+    const page = await pdfDocument.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    await page.render({ canvasContext: context, viewport }).promise;
+    return { canvas, context, viewport };
+  };
+
+  const textFreeRender = await renderCanvas(textFreeDocument);
+  const originalRender = await renderCanvas(originalDocument);
+  const canvas = originalRender.canvas;
+  const viewport = originalRender.viewport;
+  const imageWidth = canvas.width;
+  const imageHeight = canvas.height;
+  if (
+    textFreeRender.canvas.width !== imageWidth ||
+    textFreeRender.canvas.height !== imageHeight
+  ) {
+    throw new Error('PDF 原文与背景渲染尺寸不一致');
+  }
+
+  const originalImage = originalRender.context.getImageData(0, 0, imageWidth, imageHeight);
+  const textFreeImage = textFreeRender.context.getImageData(0, 0, imageWidth, imageHeight);
+  const originalPixelsForCheck = originalImage.data;
+  const textFreePixelsForCheck = textFreeImage.data;
+  const sourceLinesFor = paragraph => Array.isArray(paragraph.sourceInpaintLines) && paragraph.sourceInpaintLines.length
+    ? paragraph.sourceInpaintLines
+    : paragraph.exportLines || [];
+  const parseRunColor = run => {
+    const hex = String(run?.color || '#000000').replace('#', '');
+    const full = hex.length === 3 ? hex.split('').map(part => part + part).join('') : hex.padEnd(6, '0');
+    return [0, 2, 4].map(offset => parseInt(full.slice(offset, offset + 2), 16) || 0);
+  };
+
+  for (const paragraph of paragraphs || []) {
+    let hasMeasuredLine = false;
+    for (const line of sourceLinesFor(paragraph)) {
+      const runs = (line.runs || []).filter(run => String(run.text ?? '').trim());
+      const validRuns = runs.filter(run =>
+        [run.x, run.baseline, run.width, run.size].every(value => Number.isFinite(Number(value))));
+      if (!validRuns.length) continue;
+
+      const left = Math.min(...validRuns.map(run => Number(run.x)));
+      const right = Math.max(...validRuns.map(run => Number(run.x) + Number(run.width)));
+      const size = Math.max(...validRuns.map(run => Number(run.size) || 12));
+      const baseline = validRuns[0].baseline;
+      const horizontalPadding = Math.max(1, size * 0.18);
+      const ascent = Math.max(1, size * 1.28);
+      const descent = Math.max(1, size * 0.48);
+      const x0 = Math.max(0, Math.floor((left - horizontalPadding) * scale));
+      const x1 = Math.min(imageWidth - 1, Math.ceil((right + horizontalPadding) * scale));
+      const y0 = Math.max(0, Math.floor(viewport.height - (baseline + ascent) * scale));
+      const y1 = Math.min(imageHeight - 1, Math.ceil(viewport.height - (baseline - descent) * scale));
+      if (x1 <= x0 || y1 <= y0) continue;
+
+      let diffCount = 0;
+      let matchedColorCount = 0;
+      let minX = Number.MAX_SAFE_INTEGER;
+      let minY = Number.MAX_SAFE_INTEGER;
+      let maxX = -1;
+      let maxY = -1;
+      const declaredColors = validRuns.map(parseRunColor);
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const offset = (y * imageWidth + x) * 4;
+          const difference = Math.max(
+            Math.abs(originalPixelsForCheck[offset] - textFreePixelsForCheck[offset]),
+            Math.abs(originalPixelsForCheck[offset + 1] - textFreePixelsForCheck[offset + 1]),
+            Math.abs(originalPixelsForCheck[offset + 2] - textFreePixelsForCheck[offset + 2])
+          );
+          if (difference <= 10) continue;
+          diffCount++;
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
+          if (difference >= 28 && declaredColors.some(color => Math.hypot(
+            originalPixelsForCheck[offset] - color[0],
+            originalPixelsForCheck[offset + 1] - color[1],
+            originalPixelsForCheck[offset + 2] - color[2]
+          ) <= 96)) {
+            matchedColorCount++;
+          }
+        }
+      }
+
+      const characterCount = Math.max(1, validRuns.reduce((total, run) =>
+        total + String(run.text || '').replace(/\s+/g, '').length, 0));
+      const expectedArea = characterCount * size * size * scale * scale * 0.16;
+      const boundsMargin = Math.max(2, size * 0.22 * scale);
+      let lineReliable = diffCount > 0 &&
+        diffCount >= expectedArea * 0.015 &&
+        diffCount <= expectedArea * 16 &&
+        matchedColorCount >= diffCount * 0.03 &&
+        minX >= x0 - boundsMargin &&
+        minY >= y0 - boundsMargin &&
+        maxX <= x1 + boundsMargin &&
+        maxY <= y1 + boundsMargin;
+      paragraph.reliable = hasMeasuredLine ? (paragraph.reliable && lineReliable) : lineReliable;
+      paragraph.renderedSourcePixelCount =
+        (paragraph.renderedSourcePixelCount || 0) + diffCount;
+      hasMeasuredLine = true;
+    }
+    if (!hasMeasuredLine) paragraph.reliable = false;
+  }
+
+  if (!paragraphs.some(paragraph => paragraph.reliable === false)) {
+    return {
+      dataUrl: textFreeRender.canvas.toDataURL('image/png'),
+      patchDataUrl: null,
+      covers: [],
+      changedPixelCount: 0
+    };
+  }
+
+  const inpaintMask = new Uint8Array(imageWidth * imageHeight);
+  let inpaintBoxCount = 0;
+  for (const paragraph of paragraphs || []) {
+    if (paragraph.reliable === false) continue;
+    for (const line of sourceLinesFor(paragraph)) {
+      const runs = (line.runs || []).filter(run => String(run.text ?? '').trim());
+      const validRuns = runs.filter(run =>
+        [run.x, run.baseline, run.width, run.size].every(value => Number.isFinite(Number(value))));
+      if (!validRuns.length) continue;
+
+      let left = Math.min(...validRuns.map(run => Number(run.x)));
+      let right = Math.max(...validRuns.map(run => Number(run.x) + Number(run.width)));
+      if ([line.x, line.width].every(value => Number.isFinite(Number(value)))) {
+        left = Math.min(left, Number(line.x));
+        right = Math.max(right, Number(line.x) + Number(line.width));
+      }
+      const size = Math.max(...validRuns.map(run => Number(run.size) || 12));
+      const baseline = validRuns[0].baseline;
+      const ascent = size * 1.05;
+      const descent = size * 0.32;
+      const horizontalPadding = Math.max(1, size * 0.14);
+      const x0 = Math.max(0, Math.floor((left - horizontalPadding) * scale));
+      const x1 = Math.min(imageWidth - 1, Math.ceil((right + horizontalPadding) * scale));
+      const y0 = Math.max(0, Math.floor(viewport.height - (baseline + ascent) * scale));
+      const y1 = Math.min(imageHeight - 1, Math.ceil(viewport.height - (baseline - descent) * scale));
+      if (x1 <= x0 || y1 <= y0) continue;
+
+      for (let y = y0; y <= y1; y++) {
+        inpaintMask.fill(1, y * imageWidth + x0, y * imageWidth + x1 + 1);
+      }
+      inpaintBoxCount++;
+    }
+  }
+
+  const patchCanvas = document.createElement('canvas');
+  patchCanvas.width = imageWidth;
+  patchCanvas.height = imageHeight;
+  const patchContext = patchCanvas.getContext('2d', { willReadFrequently: true });
+  const patchImage = patchContext.createImageData(imageWidth, imageHeight);
+  const originalPixels = originalImage.data;
+  const textFreePixels = textFreeImage.data;
+  const patchPixels = patchImage.data;
+  let changedPixelCount = 0;
+
+  for (let offset = 0; offset < originalPixels.length; offset += 4) {
+    if (!inpaintMask[offset / 4]) continue;
+    const difference = Math.max(
+      Math.abs(originalPixels[offset] - textFreePixels[offset]),
+      Math.abs(originalPixels[offset + 1] - textFreePixels[offset + 1]),
+      Math.abs(originalPixels[offset + 2] - textFreePixels[offset + 2])
+    );
+    if (difference <= 6) continue;
+    patchPixels[offset + 3] = 255;
+    changedPixelCount++;
+  }
+  const seedAlpha = new Uint8Array(imageWidth * imageHeight);
+  for (let offset = 0, pixelIndex = 0; offset < patchPixels.length; offset += 4, pixelIndex++) {
+    seedAlpha[pixelIndex] = patchPixels[offset + 3];
+  }
+  const patchRadius = Math.max(6, Math.round(scale * 2.5));
+  for (let y = 0; y < imageHeight; y++) {
+    for (let x = 0; x < imageWidth; x++) {
+      const pixelIndex = y * imageWidth + x;
+      let shouldExpand = false;
+      for (let deltaY = -patchRadius; deltaY <= patchRadius && !shouldExpand; deltaY++) {
+        const sourceY = y + deltaY;
+        if (sourceY < 0 || sourceY >= imageHeight) continue;
+        for (let deltaX = -patchRadius; deltaX <= patchRadius; deltaX++) {
+          const sourceX = x + deltaX;
+          if (sourceX < 0 || sourceX >= imageWidth) continue;
+          if (seedAlpha[sourceY * imageWidth + sourceX]) {
+            shouldExpand = true;
+            break;
+          }
+        }
+      }
+      if (!shouldExpand) continue;
+      if (!inpaintMask[pixelIndex]) continue;
+      const offset = (y * imageWidth + x) * 4;
+      patchPixels[offset + 3] = 255;
+    }
+  }
+
+  const patchMask = new Uint8Array(imageWidth * imageHeight);
+  const packedColors = new Uint32Array(imageWidth * imageHeight);
+  for (let pixelIndex = 0; pixelIndex < patchMask.length; pixelIndex++) {
+    patchMask[pixelIndex] = patchPixels[pixelIndex * 4 + 3] ? 1 : 0;
+    const offset = pixelIndex * 4;
+    packedColors[pixelIndex] =
+      (255 << 24) |
+      (originalPixels[offset + 2] << 16) |
+      (originalPixels[offset + 1] << 8) |
+      originalPixels[offset];
+  }
+  const createNearestField = () => ({
+    colors: new Uint32Array(imageWidth * imageHeight),
+    distances: new Uint16Array(imageWidth * imageHeight).fill(65535)
+  });
+  const nearestLeft = createNearestField();
+  const nearestRight = createNearestField();
+  const nearestTop = createNearestField();
+  const nearestBottom = createNearestField();
+  for (let y = 0; y < imageHeight; y++) {
+    const row = y * imageWidth;
+    for (let x = 0; x < imageWidth; x++) {
+      const pixelIndex = row + x;
+      const previous = x ? pixelIndex - 1 : -1;
+      if (!patchMask[pixelIndex]) {
+        nearestLeft.colors[pixelIndex] = packedColors[pixelIndex];
+        nearestLeft.distances[pixelIndex] = 0;
+      } else if (previous >= 0) {
+        nearestLeft.colors[pixelIndex] = nearestLeft.colors[previous];
+        nearestLeft.distances[pixelIndex] = Math.min(65535, nearestLeft.distances[previous] + 1);
+      }
+      const rightIndex = row + (imageWidth - 1 - x);
+      const rightPrevious = x ? rightIndex + 1 : -1;
+      if (!patchMask[rightIndex]) {
+        nearestRight.colors[rightIndex] = packedColors[rightIndex];
+        nearestRight.distances[rightIndex] = 0;
+      } else if (rightPrevious < row + imageWidth) {
+        nearestRight.colors[rightIndex] = nearestRight.colors[rightPrevious];
+        nearestRight.distances[rightIndex] = Math.min(65535, nearestRight.distances[rightPrevious] + 1);
+      }
+    }
+  }
+  for (let x = 0; x < imageWidth; x++) {
+    for (let y = 0; y < imageHeight; y++) {
+      const pixelIndex = y * imageWidth + x;
+      const previous = y ? pixelIndex - imageWidth : -1;
+      if (!patchMask[pixelIndex]) {
+        nearestTop.colors[pixelIndex] = packedColors[pixelIndex];
+        nearestTop.distances[pixelIndex] = 0;
+      } else if (previous >= 0) {
+        nearestTop.colors[pixelIndex] = nearestTop.colors[previous];
+        nearestTop.distances[pixelIndex] = Math.min(65535, nearestTop.distances[previous] + 1);
+      }
+      const bottomIndex = (imageHeight - 1 - y) * imageWidth + x;
+      const bottomPrevious = y ? bottomIndex + imageWidth : -1;
+      if (!patchMask[bottomIndex]) {
+        nearestBottom.colors[bottomIndex] = packedColors[bottomIndex];
+        nearestBottom.distances[bottomIndex] = 0;
+      } else if (bottomPrevious < imageWidth * imageHeight) {
+        nearestBottom.colors[bottomIndex] = nearestBottom.colors[bottomPrevious];
+        nearestBottom.distances[bottomIndex] = Math.min(65535, nearestBottom.distances[bottomPrevious] + 1);
+      }
+    }
+  }
+  for (let pixelIndex = 0; pixelIndex < patchMask.length; pixelIndex++) {
+    if (!patchMask[pixelIndex]) continue;
+    const candidates = [
+      { color: nearestLeft.colors[pixelIndex], distance: nearestLeft.distances[pixelIndex] },
+      { color: nearestRight.colors[pixelIndex], distance: nearestRight.distances[pixelIndex] },
+      { color: nearestTop.colors[pixelIndex], distance: nearestTop.distances[pixelIndex] },
+      { color: nearestBottom.colors[pixelIndex], distance: nearestBottom.distances[pixelIndex] }
+    ].filter(candidate => candidate.distance < 65535);
+    if (!candidates.length) continue;
+    const nearestDistance = Math.min(...candidates.map(candidate => candidate.distance));
+    const matched = candidates.filter(candidate => candidate.distance <= nearestDistance + 1);
+    let red = 0;
+    let green = 0;
+    let blue = 0;
+    let weightTotal = 0;
+    for (const candidate of matched) {
+      const weight = 1 / (candidate.distance + 1);
+      red += (candidate.color & 255) * weight;
+      green += ((candidate.color >> 8) & 255) * weight;
+      blue += ((candidate.color >> 16) & 255) * weight;
+      weightTotal += weight;
+    }
+    const offset = pixelIndex * 4;
+    patchPixels[offset] = red / weightTotal;
+    patchPixels[offset + 1] = green / weightTotal;
+    patchPixels[offset + 2] = blue / weightTotal;
+  }
+  patchContext.putImageData(patchImage, 0, 0);
+
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    patchDataUrl: patchCanvas.toDataURL('image/png'),
+    covers: [],
+    changedPixelCount
+  };
+}
+
+/**
+ * 渲染不含 PDF 文本操作的页面背景，保留矢量图形、渐变和图片。
+ */
+async function renderAndInpaintPage(originalDocument, pageNumber, scale = 2, paragraphs = [], cleanDocument = null) {
+  const page = await originalDocument.getPage(pageNumber);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  await page.render({ canvasContext: context, viewport }).promise;
+
+  const exportRegions = [];
+  for (const paragraph of paragraphs || []) {
+    const sourceLines = Array.isArray(paragraph.sourceInpaintLines) && paragraph.sourceInpaintLines.length
+      ? paragraph.sourceInpaintLines
+      : paragraph.exportLines || [];
+    for (const line of sourceLines) {
+      if (!line?.runs?.some(run => String(run.text ?? '').trim())) continue;
+      const trimmedRuns = line.runs.filter(run => String(run.text ?? '').trim());
+      const validRuns = trimmedRuns.filter(run =>
+        [run.x, run.baseline, run.width, run.size].every(value => Number.isFinite(Number(value))));
+      if (validRuns.length === trimmedRuns.length) {
+        for (const run of validRuns) {
+          exportRegions.push({
+            x: Number(run.x),
+            baseline: Number(run.baseline),
+            width: Math.max(Number(run.width), 1),
+            size: Number(run.size),
+            color: run.color || '#000000',
+            sourceRun: run,
+            text: run.text || ''
+          });
+        }
+      } else {
+        const fallbackRun = trimmedRuns[0];
+        exportRegions.push({
+          x: Number(line.x ?? paragraph.x) || 0,
+          baseline: Number(line.baseline ?? paragraph.baseline) || 0,
+          width: Number(line.width ?? paragraph.width) || 12,
+          size: Number(line.size) || Number(paragraph.size) || Number(fallbackRun?.size) || 12,
+          color: fallbackRun?.color || paragraph.runs?.[0]?.color || '#000000',
+          sourceRun: fallbackRun,
+          text: line.text || fallbackRun?.text || ''
+        });
+      }
+    }
+  }
+
+  const inpaintStats = [];
+  let inpaintRegions = 0;
+  if (cleanDocument && exportRegions.length) {
+    try {
+      const cleanPage = await cleanDocument.getPage(pageNumber);
+      const cleanViewport = cleanPage.getViewport({ scale });
+      const cleanCanvas = document.createElement('canvas');
+      cleanCanvas.width = canvas.width;
+      cleanCanvas.height = canvas.height;
+      const cleanContext = cleanCanvas.getContext('2d', { willReadFrequently: true });
+      await cleanPage.render({ canvasContext: cleanContext, viewport: cleanViewport }).promise;
+
+      for (const region of exportRegions) {
+        const size = Math.max(4, Number(region.size) || 12);
+        const x0 = Math.max(0, Math.floor(region.x * scale - size * 0.08 * scale));
+        const x1 = Math.min(canvas.width - 1, Math.ceil((region.x + region.width) * scale + size * 0.08 * scale));
+        const y0 = Math.max(0, Math.floor(viewport.height - (region.baseline + size * 0.98) * scale));
+        const y1 = Math.min(canvas.height - 1, Math.ceil(viewport.height - (region.baseline - size * 0.26) * scale));
+        const boxWidth = x1 - x0 + 1;
+        const boxHeight = y1 - y0 + 1;
+        if (boxWidth <= 2 || boxHeight <= 2) continue;
+        context.drawImage(cleanCanvas, x0, y0, boxWidth, boxHeight, x0, y0, boxWidth, boxHeight);
+      }
+      return canvas.toDataURL('image/jpeg', 0.88);
+    } catch (error) {
+      console.warn('矢量背景重建失败，改用局部像素修复。', error);
+    }
+  }
+
+  if (exportRegions.length) {
+    const width = canvas.width;
+    const height = canvas.height;
+    const sourceImage = context.getImageData(0, 0, width, height);
+    const sourcePixel = (x, y) => {
+      const offset = (y * width + x) * 4;
+      return [
+        sourceImage.data[offset],
+        sourceImage.data[offset + 1],
+        sourceImage.data[offset + 2]
+      ];
+    };
+    const dominantColor = (samples) => {
+      if (!samples.length) return [255, 255, 255];
+      const buckets = new Map();
+      samples.forEach(color => {
+        const key = ((color[0] >> 4) << 8) | ((color[1] >> 4) << 4) | (color[2] >> 4);
+        const bucket = buckets.get(key) || { count: 0, sum: [0, 0, 0] };
+        bucket.count++;
+        bucket.sum[0] += color[0];
+        bucket.sum[1] += color[1];
+        bucket.sum[2] += color[2];
+        buckets.set(key, bucket);
+      });
+      const center = [...buckets.values()].sort((left, right) => right.count - left.count)[0];
+      const matched = samples.filter(color =>
+        Math.hypot(color[0] - center.sum[0] / center.count,
+          color[1] - center.sum[1] / center.count,
+          color[2] - center.sum[2] / center.count) <= 64);
+      const source = matched.length ? matched : samples;
+      return [0, 1, 2].map(index => source.reduce((sum, color) => sum + color[index], 0) / source.length);
+    };
+
+    const targetColor = (value) => {
+      const hex = String(value || '#000000').replace('#', '');
+      const full = hex.length === 3 ? hex.split('').map(part => part + part).join('') : hex.padEnd(6, '0');
+      return [0, 2, 4].map(offset => parseInt(full.slice(offset, offset + 2), 16) || 0);
+    };
+    const colorHex = (value) => value.map(channel =>
+      Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, '0')
+    ).join('').toUpperCase();
+
+    const nearestKnown = (data, mask, x, y, deltaX, deltaY, boxWidth, boxHeight, x0, y0) => {
+      let currentX = x + deltaX;
+      let currentY = y + deltaY;
+      let distance = 1;
+      while (currentX >= 0 && currentX < width && currentY >= 0 && currentY < height) {
+        const insideX = currentX >= 0 && currentX < boxWidth;
+        const insideY = currentY >= 0 && currentY < boxHeight;
+        if (!insideX || !insideY || !mask[currentY * boxWidth + currentX]) {
+          const globalX = x0 + currentX;
+          const globalY = y0 + currentY;
+          const color = insideX && insideY
+            ? null
+            : sourcePixel(globalX, globalY);
+          const offset = insideX && insideY ? (currentY * boxWidth + currentX) * 4 : 0;
+          const resolved = color || [data[offset], data[offset + 1], data[offset + 2]];
+          return {
+            color: resolved,
+            distance
+          };
+        }
+        currentX += deltaX;
+        currentY += deltaY;
+        distance++;
+      }
+      return null;
+    };
+
+    const eraseRun = (region) => {
+      const size = Math.max(4, Number(region.size) || 12);
+      const ascent = size * 0.98;
+      const descent = size * 0.26;
+      const padding = size * 0.08 * scale;
+      const x0 = Math.max(0, Math.floor(region.x * scale - padding));
+      const x1 = Math.min(width - 1, Math.ceil((region.x + region.width) * scale + padding));
+      const y0 = Math.max(0, Math.floor(viewport.height - (region.baseline + ascent) * scale));
+      const y1 = Math.min(height - 1, Math.ceil(viewport.height - (region.baseline - descent) * scale));
+      if (x1 <= x0 || y1 <= y0) return;
+      inpaintRegions++;
+
+      const boxWidth = x1 - x0 + 1;
+      const boxHeight = y1 - y0 + 1;
+      const patch = context.getImageData(x0, y0, boxWidth, boxHeight);
+      const data = patch.data;
+      const mask = new Uint8Array(boxWidth * boxHeight);
+      const borderColors = [];
+      const border = [];
+      const localBackgroundSamples = [];
+      for (let x = x0 - 2; x <= x1 + 2; x += 2) {
+        for (const y of [y0 - 2, y1 + 2]) {
+          if (x >= 0 && x < width && y >= 0 && y < height) {
+            border.push(sourcePixel(x, y));
+          }
+        }
+      }
+      for (let y = y0; y <= y1; y += 2) {
+        for (const x of [x0 - 2, x1 + 2]) {
+          if (x >= 0 && x < width && y >= 0 && y < height) {
+            border.push(sourcePixel(x, y));
+          }
+        }
+      }
+      borderColors.push(...border);
+      const sortedBackground = [...borderColors].sort((left, right) =>
+        (left[0] + left[1] + left[2]) - (right[0] + right[1] + right[2]));
+      const background = sortedBackground.length
+        ? sortedBackground[Math.floor(sortedBackground.length / 2)]
+        : [255, 255, 255];
+
+      const area = boxWidth * boxHeight;
+      const buckets = new Map();
+      for (let y = 0; y < boxHeight; y += 1) {
+        for (let x = 0; x < boxWidth; x += 1) {
+          const offset = (y * boxWidth + x) * 4;
+          const color = [data[offset], data[offset + 1], data[offset + 2]];
+          const key = ((color[0] >> 4) << 8) | ((color[1] >> 4) << 4) | (color[2] >> 4);
+          const bucket = buckets.get(key) || { count: 0, sum: [0, 0, 0] };
+          bucket.count++;
+          bucket.sum[0] += color[0];
+          bucket.sum[1] += color[1];
+          bucket.sum[2] += color[2];
+          buckets.set(key, bucket);
+        }
+      }
+
+      const declaredTarget = targetColor(region.color);
+      const declaredDistance = Math.hypot(
+        declaredTarget[0] - background[0],
+        declaredTarget[1] - background[1],
+        declaredTarget[2] - background[2]
+      );
+      const candidates = [...buckets.values()]
+        .map(bucket => ({
+          count: bucket.count,
+          color: bucket.sum.map(value => value / bucket.count),
+          distance: Math.hypot(
+            bucket.sum[0] / bucket.count - background[0],
+            bucket.sum[1] / bucket.count - background[1],
+            bucket.sum[2] / bucket.count - background[2]
+          )
+        }))
+        .filter(candidate => candidate.count >= Math.max(2, area * 0.002) &&
+          candidate.distance >= Math.max(36, declaredDistance * 0.55));
+      if (declaredDistance >= 48) {
+        let declaredCount = 0;
+        for (let y = 0; y < boxHeight; y += 1) {
+          for (let x = 0; x < boxWidth; x += 1) {
+            const offset = (y * boxWidth + x) * 4;
+            if (Math.hypot(
+              data[offset] - declaredTarget[0],
+              data[offset + 1] - declaredTarget[1],
+              data[offset + 2] - declaredTarget[2]
+            ) <= Math.max(42, declaredDistance * 0.24)) {
+              declaredCount++;
+            }
+          }
+        }
+        if (declaredCount >= Math.max(2, area * 0.002)) {
+          candidates.push({ count: declaredCount, color: declaredTarget, distance: declaredDistance });
+        }
+      }
+      const foreground = candidates
+        .map(candidate => ({
+          ...candidate,
+          score: candidate.distance * Math.log(candidate.count + 1)
+        }))
+        .sort((left, right) => right.score - left.score)[0];
+      if (!foreground) {
+        inpaintStats.push({
+          text: region.text || '',
+          x0, y0, boxWidth, boxHeight,
+          target: declaredTarget,
+          background,
+          targetLimit: 0,
+          maskCount: 0,
+          dilatedCount: 0,
+          writes: 0,
+          skipped: true
+        });
+        return;
+      }
+
+      const declaredToForegroundDistance = Math.hypot(
+        declaredTarget[0] - foreground.color[0],
+        declaredTarget[1] - foreground.color[1],
+        declaredTarget[2] - foreground.color[2]
+      );
+      if (region.sourceRun && declaredDistance < foreground.distance * 0.72 &&
+        declaredToForegroundDistance > Math.max(65, foreground.distance * 0.72)) {
+        const measuredColor = colorHex(foreground.color);
+        region.color = '#' + measuredColor;
+        region.sourceRun.color = region.color;
+      }
+      const measuredTarget = targetColor(region.color);
+      const measuredDeclaredDistance = Math.hypot(
+        measuredTarget[0] - background[0],
+        measuredTarget[1] - background[1],
+        measuredTarget[2] - background[2]
+      );
+      if (measuredDeclaredDistance < foreground.distance * 0.72) {
+        inpaintStats.push({
+          text: region.text || '',
+          x0, y0, boxWidth, boxHeight,
+          target: measuredTarget,
+          background,
+          targetLimit: 0,
+          maskCount: 0,
+          dilatedCount: 0,
+          writes: 0,
+          skipped: true
+        });
+        return;
+      }
+
+      const target = foreground.color;
+      const targetBackgroundDistance = foreground.distance;
+      const targetLimit = Math.max(42, targetBackgroundDistance * 0.86);
+      const perpendicularLimit = Math.max(34, targetBackgroundDistance * 0.48);
+
+      for (let y = 0; y < boxHeight; y++) {
+        for (let x = 0; x < boxWidth; x++) {
+          const offset = (y * boxWidth + x) * 4;
+          const targetDistance = Math.hypot(
+            data[offset] - target[0],
+            data[offset + 1] - target[1],
+            data[offset + 2] - target[2]
+          );
+          const backgroundDistance = Math.hypot(
+            data[offset] - background[0],
+            data[offset + 1] - background[1],
+            data[offset + 2] - background[2]
+          );
+          const blendX = data[offset] - background[0];
+          const blendY = data[offset + 1] - background[1];
+          const blendZ = data[offset + 2] - background[2];
+          const targetX = target[0] - background[0];
+          const targetY = target[1] - background[1];
+          const targetZ = target[2] - background[2];
+          const targetLengthSquared = targetX * targetX + targetY * targetY + targetZ * targetZ;
+          const blendRatio = targetLengthSquared
+            ? (blendX * targetX + blendY * targetY + blendZ * targetZ) / targetLengthSquared
+            : 0;
+          const segmentX = blendX - blendRatio * targetX;
+          const segmentY = blendY - blendRatio * targetY;
+          const segmentZ = blendZ - blendRatio * targetZ;
+          const blendDistance = Math.hypot(segmentX, segmentY, segmentZ);
+          if (targetDistance <= targetLimit ||
+            (blendRatio >= 0.16 && blendRatio <= 1.08 && blendDistance <= perpendicularLimit)) {
+            mask[y * boxWidth + x] = 1;
+          }
+        }
+      }
+
+      const dilated = new Uint8Array(mask);
+      for (let y = 0; y < boxHeight; y++) {
+        for (let x = 0; x < boxWidth; x++) {
+          if (!mask[y * boxWidth + x]) continue;
+          for (let offsetY = -1; offsetY <= 1; offsetY++) {
+            for (let offsetX = -1; offsetX <= 1; offsetX++) {
+              const nearbyY = y + offsetY;
+              const nearbyX = x + offsetX;
+              if (nearbyY >= 0 && nearbyY < boxHeight && nearbyX >= 0 && nearbyX < boxWidth) {
+                dilated[nearbyY * boxWidth + nearbyX] = 1;
+              }
+            }
+          }
+        }
+      }
+      inpaintStats.push({
+        text: region.text || '',
+        x0, y0, boxWidth, boxHeight,
+        target,
+        background,
+        targetLimit,
+        maskCount: mask.reduce((sum, value) => sum + value, 0),
+        dilatedCount: dilated.reduce((sum, value) => sum + value, 0),
+        writes: 0
+      });
+      const stat = inpaintStats[inpaintStats.length - 1];
+
+      for (let y = 0; y < boxHeight; y++) {
+        for (let x = 0; x < boxWidth; x++) {
+          if (!dilated[y * boxWidth + x]) continue;
+          const candidates = [
+            nearestKnown(data, dilated, x, y, -1, 0, boxWidth, boxHeight, x0, y0),
+            nearestKnown(data, dilated, x, y, 1, 0, boxWidth, boxHeight, x0, y0),
+            nearestKnown(data, dilated, x, y, 0, -1, boxWidth, boxHeight, x0, y0),
+            nearestKnown(data, dilated, x, y, 0, 1, boxWidth, boxHeight, x0, y0)
+          ].filter(Boolean);
+          if (!candidates.length) continue;
+          let red = 0;
+          let green = 0;
+          let blue = 0;
+          let totalWeight = 0;
+          for (const candidate of candidates) {
+            const weight = 1 / (candidate.distance * candidate.distance);
+            red += candidate.color[0] * weight;
+            green += candidate.color[1] * weight;
+            blue += candidate.color[2] * weight;
+            totalWeight += weight;
+          }
+          const offset = (y * boxWidth + x) * 4;
+          data[offset] = Math.round(red / totalWeight);
+          data[offset + 1] = Math.round(green / totalWeight);
+          data[offset + 2] = Math.round(blue / totalWeight);
+          data[offset + 3] = 255;
+          stat.writes++;
+        }
+      }
+      context.putImageData(patch, x0, y0);
+    };
+
+    for (const region of exportRegions) eraseRun(region);
+    void inpaintRegions;
+  }
+
+  if (cleanDocument && exportRegions.length) {
+    const cleanPage = await cleanDocument.getPage(pageNumber);
+    const cleanViewport = cleanPage.getViewport({ scale });
+    const cleanCanvas = document.createElement('canvas');
+    cleanCanvas.width = canvas.width;
+    cleanCanvas.height = canvas.height;
+    const cleanContext = cleanCanvas.getContext('2d', { willReadFrequently: true });
+    await cleanPage.render({ canvasContext: cleanContext, viewport: cleanViewport }).promise;
+
+    for (const region of exportRegions) {
+      const size = Math.max(4, Number(region.size) || 12);
+      const x0 = Math.max(0, Math.floor(region.x * scale - size * 0.08 * scale));
+      const x1 = Math.min(canvas.width - 1, Math.ceil((region.x + region.width) * scale + size * 0.08 * scale));
+      const y0 = Math.max(0, Math.floor(viewport.height - (region.baseline + size * 0.98) * scale));
+      const y1 = Math.min(canvas.height - 1, Math.ceil(viewport.height - (region.baseline - size * 0.26) * scale));
+      const boxWidth = x1 - x0 + 1;
+      const boxHeight = y1 - y0 + 1;
+      if (boxWidth <= 2 || boxHeight <= 2) continue;
+
+      const pad = 4;
+      const sampleX = Math.max(0, x0 - pad);
+      const sampleY = Math.max(0, y0 - pad);
+      const sampleWidth = Math.min(canvas.width, x1 + pad + 1) - sampleX;
+      const sampleHeight = Math.min(canvas.height, y1 + pad + 1) - sampleY;
+      if (sampleWidth <= 0 || sampleHeight <= 0) continue;
+      const originalSamples = context.getImageData(sampleX, sampleY, sampleWidth, sampleHeight).data;
+      const cleanSamples = cleanContext.getImageData(sampleX, sampleY, sampleWidth, sampleHeight).data;
+      const pixelAt = (samples, x, y) => {
+        const offset = ((y - sampleY) * sampleWidth + (x - sampleX)) * 4;
+        return [samples[offset], samples[offset + 1], samples[offset + 2]];
+      };
+      const ringAverage = (samples, inside) => {
+        const ring = Math.max(2, Math.round(Math.min(boxWidth, boxHeight) * 0.08));
+        const points = [];
+        for (let x = x0; x <= x1; x += 2) {
+          points.push([x, inside ? y0 + ring : y0 - 2]);
+          points.push([x, inside ? y1 - ring : y1 + 2]);
+        }
+        for (let y = y0; y <= y1; y += 2) {
+          points.push([inside ? x0 + ring : x0 - 2, y]);
+          points.push([inside ? x1 - ring : x1 + 2, y]);
+        }
+        const validSamples = points.filter(([x, y]) =>
+          x >= sampleX && x < sampleX + sampleWidth && y >= sampleY && y < sampleY + sampleHeight
+        ).map(([x, y]) => pixelAt(samples, x, y));
+        if (!validSamples.length) return null;
+        return [0, 1, 2].map(index =>
+          validSamples.reduce((sum, color) => sum + color[index], 0) / validSamples.length);
+      };
+
+      const outsideAverage = ringAverage(originalSamples, false);
+      const cleanBorderAverage = ringAverage(cleanSamples, true);
+      if (!outsideAverage || !cleanBorderAverage) continue;
+      const borderDistance = Math.hypot(
+        outsideAverage[0] - cleanBorderAverage[0],
+        outsideAverage[1] - cleanBorderAverage[1],
+        outsideAverage[2] - cleanBorderAverage[2]
+      );
+      context.drawImage(cleanCanvas, x0, y0, boxWidth, boxHeight, x0, y0, boxWidth, boxHeight);
+    }
+  }
+
+  return canvas.toDataURL('image/jpeg', 0.88);
 }
 
 function paragraphTopPt(model, block) {
@@ -1385,8 +2222,9 @@ async function awaitSwitchTab(i) {
     state, viewer, annotations, contentEditor, search, tabs,
     openFromPath, doExport, doSave, doSaveAs, doBatchPrint, doExportText,
     doExportImage, doExportAllImages,
-    buildPptxExport, buildXlsxExport, buildPptxEditableExport, buildWordLayoutExport, buildPptxEditableExportV2, buildParagraphExportPages, mapFontName, isGarbled, markRecurringLines, buildTxtExport, capturePageImage, buildPageImageExport, collectPageLines, doExportAs,
-    tools, openFromBytes, doNewBlank, doNewFromImages, applyPageReorder, listTestExport: () => window.onyx.testExportList(), renderPageErased: async (p) => renderPageErased(p, 2), renderPageErasedDebug: async (p) => { const r = await renderPageErased(p, 2); return { lines: r.lines.filter(l => /\u76ee\u5f55|\u4e91\u4ea7\u54c1/.test(l.text)).map(l => ({ text: l.text.slice(0,20), x: Math.round(l.x), y: Math.round(l.y), size: l.size, hidden: !!l.hidden, garbled: !!l.garbled })) }; },
+    buildPptxExport, buildXlsxExport, buildPptxEditableExport, buildWordLayoutExport, buildPptxEditableExportV2, buildParagraphExportPages, flattenParagraphExportBackgrounds, mapFontName, isGarbled, markRecurringLines, buildTxtExport, capturePageImage, buildPageImageExport, collectPageLines, doExportAs, createTextFreeDocumentBytes, renderAndInpaintPage, renderPageBackgroundPatch,
+    tools, openFromBytes, doNewBlank, doNewFromImages, applyPageReorder, listTestExport: () => window.onyx.testExportList(), renderPageErased: async (p) => renderPageErased(p, 2), renderPageErasedDebug: async (p) => { const r = await renderPageErased(p, 2); return { lines: r.lines.filter(l => /\u76ee\u5f55|\u4e91\u4ea7\u54c1/.test(l.text)).map(l => ({ text: l.text.slice(0,20), x: Math.round(l.x), y: Math.round(l.y), size: l.size, hidden: !!l.hidden, garbled: !!l.garbled })) }; }, extractContentPage,
+    pdfjsLib,
     activateTab, closeTab
   };
 })();

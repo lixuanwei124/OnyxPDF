@@ -125,6 +125,7 @@ function streamBytes(pdfLib, stream) {
   if (stream instanceof pdfLib.PDFRawStream && pdfLib.decodePDFRawStream) {
     return pdfLib.decodePDFRawStream(stream).decode();
   }
+  if (typeof stream.getUnencodedContents === 'function') return stream.getUnencodedContents();
   if (typeof stream.getContentsString === 'function') return stringToBytes(stream.getContentsString());
   return stream.asUint8Array();
 }
@@ -132,7 +133,7 @@ function streamBytes(pdfLib, stream) {
 function dictionaryOf(anyObject) {
   const context = anyObject?.context || anyObject?.dict?.context;
   const value = anyObject?.context && anyObject?.dict ? anyObject : context?.lookup(anyObject);
-  return value?.dict ? value : null;
+  return value?.dict ? value : (value?.keys ? value : null);
 }
 
 function rewriteStream(pdfLib, reference, stream, resources, removeSet, state, visiting, mutate = false) {
@@ -161,30 +162,35 @@ function rewriteStream(pdfLib, reference, stream, resources, removeSet, state, v
     if (operation.operator === 'Do' && resources) {
       const name = operation.operands?.find(item => item.text.startsWith('/'))?.text.slice(1);
       const resourceDict = dictionaryOf(resources);
-      const formReference = resourceDict?.get(pdfLib.PDFName.of('XObject'))?.get(name);
-      const form = formReference ? dictionaryOf(resources).context.lookup(formReference) : null;
+      const formReference = name
+        ? resourceDict?.get(pdfLib.PDFName.of('XObject'))?.get(pdfLib.PDFName.of(name))
+        : null;
+      const form = formReference ? state.context.lookup(formReference) : null;
       const subtype = form?.dict?.get?.(pdfLib.PDFName.of('Subtype'))?.asString?.() || '';
       if (form && subtype.includes('Form')) {
         const inherited = form.dict.get(pdfLib.PDFName.of('Resources')) || resources;
         const formResources = dictionaryOf(inherited) || dictionaryOf(resources);
-        const result = rewriteStream(pdfLib, formReference, form, formResources, removeSet, state, visiting);
-        if (result.changed) {
-          pieces.push(source.slice(cursor, operation.start));
-          pieces.push(`q\n${result.text}\nQ`);
-          cursor = operation.end;
-          changed = true;
-        }
+        const result = rewriteStream(pdfLib, formReference, form, formResources, removeSet, state, visiting, true);
+        changed = changed || result.changed;
       }
     }
   }
 
   pieces.push(source.slice(cursor));
   const result = { changed, text: pieces.join('') };
-  if (mutate && changed && stream instanceof pdfLib.PDFRawStream) {
-    stream.contents = stringToBytes(result.text);
-    stream.dict.delete(pdfLib.PDFName.of('Filter'));
-    stream.dict.delete(pdfLib.PDFName.of('DecodeParms'));
-    stream.updateDict();
+  if (mutate && changed && state.context) {
+    const changedBytes = stringToBytes(result.text);
+    if (stream instanceof pdfLib.PDFRawStream) {
+      stream.contents = changedBytes;
+      stream.dict.delete(pdfLib.PDFName.of('Filter'));
+      stream.dict.delete(pdfLib.PDFName.of('DecodeParms'));
+      stream.updateDict();
+    } else {
+      const cleanDict = stream.dict.clone(state.context);
+      cleanDict.delete(pdfLib.PDFName.of('Filter'));
+      cleanDict.delete(pdfLib.PDFName.of('DecodeParms'));
+      state.context.assign(reference, pdfLib.PDFRawStream.of(cleanDict, changedBytes));
+    }
   }
   if (guardKey != null) visiting.delete(guardKey);
   return result;
@@ -198,12 +204,12 @@ export function removeTextOperations(pdfDocument, pageIndex, sourceOperations, o
   const removeAll = options.all === true;
   const removeSet = new Set(sourceOperations || []);
   const page = pdfDocument.getPage(pageIndex);
-  const state = { showIndex: 0, removed: new Set(), removeAll };
   const context = pdfDocument.context;
+  const state = { showIndex: 0, removed: new Set(), removeAll, context };
   const contents = page.node.normalizedEntries().Contents;
   const container = context.lookup(contents);
   const references = container?.asArray ? container.asArray() : [contents];
-  const resources = dictionaryOf(context.lookup(page.node.Resources));
+  const resources = dictionaryOf(context.lookup(page.node.Resources()));
   const visiting = new Set();
   for (const reference of references) {
     const stream = context.lookup(reference);
@@ -213,4 +219,85 @@ export function removeTextOperations(pdfDocument, pageIndex, sourceOperations, o
     throw new Error(`PDF 原文移除不完整：${state.removed.size}/${removeSet.size}`);
   }
   return true;
+}
+
+export function removeMarkedContentOperations(pdfDocument, pageIndex, markedContentIds) {
+  const wanted = new Set((markedContentIds || []).map(Number).filter(Number.isInteger));
+  if (!wanted.size) return false;
+  const pdfLib = window.PDFLib;
+  if (!pdfLib?.PDFRawStream || !pdfLib?.decodePDFRawStream) {
+    throw new Error('PDF 内容流编辑组件不可用');
+  }
+
+  const page = pdfDocument.getPage(pageIndex);
+  const context = pdfDocument.context;
+  const contents = page.node.normalizedEntries().Contents;
+  const container = context.lookup(contents);
+  const references = container?.asArray ? container.asArray() : [contents];
+  const resources = dictionaryOf(context.lookup(page.node.Resources()));
+  let changed = false;
+  const visiting = new Set();
+
+  const removeRanges = (reference, stream, streamResources) => {
+    const guardKey = reference?.objectNumber;
+    if (guardKey != null && visiting.has(guardKey)) return;
+    if (guardKey != null) visiting.add(guardKey);
+    const { source, operations: streamOperations } = operations(streamBytes(pdfLib, stream));
+    const pieces = [];
+    let cursor = 0;
+    let skipDepth = 0;
+    let removeStart = -1;
+
+    for (let index = 0; index < streamOperations.length; index++) {
+      const operation = streamOperations[index];
+      const shouldRemove = skipDepth > 0;
+      if (!shouldRemove && operation.operator === 'BDC') {
+        const operandText = (operation.operands || []).map(item => item.text).join(' ');
+        const match = /\/MCID\s+(\d+)/.exec(operandText);
+        if (match && wanted.has(Number(match[1]))) {
+          removeStart = operation.start;
+          skipDepth = 1;
+        }
+      } else if (skipDepth > 0 && operation.operator === 'BDC') {
+        skipDepth++;
+      } else if (skipDepth > 0 && operation.operator === 'EMC') {
+        skipDepth--;
+        if (skipDepth === 0 && removeStart >= 0) {
+          pieces.push(source.slice(cursor, removeStart));
+          cursor = operation.end;
+          removeStart = -1;
+          changed = true;
+        }
+      }
+
+      if (operation.operator === 'Do' && streamResources) {
+        const name = operation.operands?.find(item => item.text.startsWith('/'))?.text.slice(1);
+        const resourceDict = dictionaryOf(streamResources);
+        const formReference = resourceDict?.get(pdfLib.PDFName.of('XObject'))?.get(name);
+        const form = formReference ? context.lookup(formReference) : null;
+        const subtype = form?.dict?.get?.('Subtype')?.asString?.() || '';
+        if (form && subtype.includes('Form')) {
+          const inherited = form.dict.get(pdfLib.PDFName.of('Resources')) || streamResources;
+          removeRanges(formReference, form, dictionaryOf(inherited) || dictionaryOf(streamResources));
+        }
+      }
+    }
+
+    if (removeStart >= 0) return;
+    pieces.push(source.slice(cursor));
+    const result = pieces.join('');
+    if (changed && stream instanceof pdfLib.PDFRawStream) {
+      stream.contents = stringToBytes(result);
+      stream.dict.delete(pdfLib.PDFName.of('Filter'));
+      stream.dict.delete(pdfLib.PDFName.of('DecodeParms'));
+      stream.updateDict();
+    }
+    if (guardKey != null) visiting.delete(guardKey);
+  };
+
+  for (const reference of references) {
+    const stream = context.lookup(reference);
+    if (stream?.dict) removeRanges(reference, stream, resources);
+  }
+  return changed;
 }
