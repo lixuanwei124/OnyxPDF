@@ -1,7 +1,7 @@
 {
   "name": "onyx-pdf",
   "productName": "OnyxPDF",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "OnyxPDF",
   "main": "src/main/main.js",
   "author": "OnyxPDF Project",
@@ -45,11 +45,21 @@
             "x64"
           ]
         }
+      ],
+      "fileAssociations": [
+        {
+          "ext": "pdf",
+          "name": "PDF Document",
+          "description": "PDF Document",
+          "mimeType": "application/pdf",
+          "role": "Viewer",
+          "rank": 1
+        }
       ]
     },
     "nsis": {
       "oneClick": false,
-      "perMachine": false,
+      "perMachine": true,
       "allowToChangeInstallationDirectory": true,
       "artifactName": "OnyxPDF Setup ${version}.exe"
     }
