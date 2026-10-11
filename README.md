@@ -2,6 +2,19 @@
 
 OnyxPDF，国产一站式PDF阅览工具，支持文档编辑、多格式导出，高效处理PDF文档。本地处理，无云端依赖，文档不出本机。
 
+> **English:** OnyxPDF is an all-in-one, offline-first PDF reader and toolkit for Windows. It covers reading, annotation, content editing, page management, and export to DOCX/PPTX/XLSX/images. Everything runs locally on your machine - your documents never leave it.
+
+[下载](#下载) · [参与 Contributing](#参与-contributing) · [开发](#开发)
+
+## 下载
+
+Windows x64 安装包请前往 [GitHub Releases](https://github.com/YOUR_GITHUB_USERNAME/onyx-pdf/releases/latest)。
+
+## 截图（占位）
+
+> TODO: 在 `docs/` 下放置主界面截图（建议 1600x900 PNG），并在此处引用。
+> <!-- ![OnyxPDF 主界面](docs/screenshot-main.png) -->
+
 ## 功能
 
 ### 阅读核心（PDF.js 引擎）
@@ -62,6 +75,10 @@ npm run dist
 工程结构：`src/main`（主进程 IPC）· `src/renderer`（UI 与阅览、批注、检索、工具模块）。
 
 构建与打包详见 [BUILD.md](BUILD.md)。Windows 安装包：`dist_out/OnyxPDF Setup 1.0.2.exe`（NSIS，含桌面/开始菜单快捷方式与卸载器）。
+
+## 参与 Contributing
+
+欢迎通过 Issue 反馈问题、提交 Pull Request。贡献流程与环境要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可
 
