@@ -8,12 +8,11 @@ OnyxPDF，国产一站式PDF阅览工具，支持文档编辑、多格式导出�
 
 ## 下载
 
-Windows x64 安装包请前往 [GitHub Releases](https://github.com/YOUR_GITHUB_USERNAME/onyx-pdf/releases/latest)。
+Windows x64 安装包请前往 [GitHub Releases](https://github.com/lixuanwei124/OnyxPDF/releases/latest)。
 
-## 截图（占位）
+## 截图
 
-> TODO: 在 `docs/` 下放置主界面截图（建议 1600x900 PNG），并在此处引用。
-> <!-- ![OnyxPDF 主界面](docs/screenshot-main.png) -->
+![OnyxPDF 主界面](docs/screenshot-main.png)
 
 ## 功能
 
