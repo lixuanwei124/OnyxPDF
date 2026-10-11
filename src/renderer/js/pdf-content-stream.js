@@ -136,6 +136,69 @@ function dictionaryOf(anyObject) {
   return value?.dict ? value : (value?.keys ? value : null);
 }
 
+function baseFontName(font) {
+  const value = font?.get?.(pdfName('BaseFont'))?.decodeText?.() ||
+    font?.get?.(pdfName('BaseFont'))?.asString?.() || '';
+  return String(value).replace(/^\//, '').replace(/^[A-Z]{6}\+/, '').trim();
+}
+
+function pdfName(value) {
+  return window.PDFLib.PDFName.of(value);
+}
+
+export function unreliableFontNames(pdfDocument, pageIndex) {
+  const pdfLib = window.PDFLib;
+  if (!pdfLib?.PDFName) return new Set();
+  const page = pdfDocument.getPage(pageIndex);
+  const context = pdfDocument.context;
+  const names = new Set();
+  const visiting = new Set();
+
+  const visitResources = resources => {
+    const resourceDict = dictionaryOf(resources);
+    if (!resourceDict) return;
+    const fonts = resourceDict.lookupMaybe(pdfName('Font'), pdfLib.PDFDict);
+    if (!fonts) return;
+    for (const [, reference] of fonts.entries()) {
+      const key = reference?.objectNumber;
+      if (key != null && visiting.has(key)) continue;
+      if (key != null) visiting.add(key);
+      const font = context.lookup(reference);
+      const subtype = nameOf(font?.get?.(pdfName('Subtype')));
+      const baseFont = baseFontName(font);
+      if ((subtype === 'Type0' && !font.get(pdfName('ToUnicode'))) || subtype === 'Type3') {
+        if (baseFont) names.add(baseFont);
+      }
+      if (subtype === 'Type0') {
+        const descendant = context.lookup(font.get(pdfName('DescendantFonts'))?.get?.(0) ||
+          font.get(pdfName('DescendantFonts')));
+        const descendantName = baseFontName(descendant);
+        if ((subtype === 'Type0' && !font.get(pdfName('ToUnicode'))) && descendantName) names.add(descendantName);
+      }
+      const formResources = font?.get?.(pdfName('Resources'));
+      if (formResources) visitResources(formResources);
+    }
+  };
+
+  visitResources(dictionaryOf(context.lookup(page.node.Resources())));
+  return names;
+}
+
+function nameOf(value) {
+  return String(value?.asString?.() ?? value?.decodeText?.() ?? '').replace(/^\//, '');
+}
+
+function isProtectedFont(resources, fontName, protectedNames) {
+  const resourceDict = dictionaryOf(resources);
+  const font = resourceDict?.lookupMaybe?.(pdfName('Font'), window.PDFLib.PDFDict)
+    ?.lookupMaybe?.(fontName, window.PDFLib.PDFDict);
+  if (!font) return false;
+  const subtype = nameOf(font.get(pdfName('Subtype')));
+  if (subtype === 'Type3') return true;
+  if (subtype === 'Type0' && !font.get(pdfName('ToUnicode'))) return true;
+  return protectedNames.has(baseFontName(font));
+}
+
 function rewriteStream(pdfLib, reference, stream, resources, removeSet, state, visiting, mutate = false) {
   const guardKey = reference?.objectNumber;
   if (guardKey != null && visiting.has(guardKey)) return { changed: false, text: '' };
@@ -144,13 +207,23 @@ function rewriteStream(pdfLib, reference, stream, resources, removeSet, state, v
   const pieces = [];
   let cursor = 0;
   let changed = false;
+  let protectedFont = false;
+  const fontStack = [];
 
   for (const operation of streamOperations) {
+    if (operation.operator === 'q') {
+      fontStack.push(protectedFont);
+    } else if (operation.operator === 'Q') {
+      protectedFont = fontStack.pop() || false;
+    } else if (operation.operator === 'Tf') {
+      const name = operation.operands?.find(item => item.text.startsWith('/'))?.text.slice(1);
+      protectedFont = name ? isProtectedFont(resources, pdfLib.PDFName.of(name), state.protectedNames) : false;
+    }
     if (TEXT_OPERATORS.has(operation.operator)) {
       const index = state.showIndex++;
       pieces.push(source.slice(cursor, operation.start));
       cursor = operation.end;
-      if (state.removeAll || removeSet.has(index)) {
+      if ((state.removeAll && !protectedFont) || removeSet.has(index)) {
         changed = true;
         state.removed.add(index);
       } else {
@@ -206,6 +279,7 @@ export function removeTextOperations(pdfDocument, pageIndex, sourceOperations, o
   const page = pdfDocument.getPage(pageIndex);
   const context = pdfDocument.context;
   const state = { showIndex: 0, removed: new Set(), removeAll, context };
+  state.protectedNames = unreliableFontNames(pdfDocument, pageIndex);
   const contents = page.node.normalizedEntries().Contents;
   const container = context.lookup(contents);
   const references = container?.asArray ? container.asArray() : [contents];

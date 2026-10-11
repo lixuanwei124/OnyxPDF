@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('onyx', {
   appVersion: () => ipcRenderer.invoke('onyx:app-version'),
   testExportList: () => ipcRenderer.invoke('onyx:test-export-list'),
   readPdf: (p) => ipcRenderer.invoke('onyx:read-pdf', p),
+  decryptPdf: (bytes) => ipcRenderer.invoke('onyx:decrypt-pdf', bytes),
   readFontFile: (path) => ipcRenderer.invoke('onyx:read-font-file', path),
   recentsGet: () => ipcRenderer.invoke('onyx:recents-get'),
   recentsAdd: (entry) => ipcRenderer.invoke('onyx:recents-add', entry),

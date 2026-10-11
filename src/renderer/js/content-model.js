@@ -1,4 +1,5 @@
 import * as pdfjsLib from '../vendor/pdf.min.mjs';
+import { unreliableFontNames } from './pdf-content-stream.js';
 
 function glyphText(args) {
   return (args || []).map(glyph => {
@@ -176,24 +177,58 @@ async function analyzeRenderedTextItems(page, items, desiredColors = []) {
   return appearance;
 }
 
+function decodeLegacyFontName(value) {
+  const text = String(value || '');
+  if (!/^[\x20-\x7e\u00a0-\u00ff]+$/.test(text) || !/[\u00a0-\u00ff]/.test(text)) return text;
+  try {
+    const bytes = new Uint8Array([...text].map(character => character.charCodeAt(0) & 0xff));
+    const decoded = new TextDecoder('gbk').decode(bytes).trim();
+    return decoded || text;
+  } catch (_) {
+    return text;
+  }
+}
+
+function canonicalFontName(value) {
+  let name = decodeLegacyFontName(value)
+    .replace(/^[A-Z]{6}\+/, '')
+    .replace(/[-_ ]?(?:Bold|Heavy|Black|Semib?old|Light|Medium|Italic|Oblique)$/i, '')
+    .trim();
+  const aliases = new Map([
+    ['MicrosoftYaHei', 'Microsoft YaHei'],
+    ['MicrosoftYaHeiUI', 'Microsoft YaHei UI'],
+    ['SimSun', '宋体'],
+    ['NSimSun', '新宋体'],
+    ['SimHei', '黑体'],
+    ['KaiTi', '楷体'],
+    ['FangSong', '仿宋'],
+    ['DengXian', '等线'],
+    ['SymbolMT', 'Symbol']
+  ]);
+  return aliases.get(name) || name;
+}
+
 function fontInfo(page, fontId) {
   try {
     const font = page.commonObjs.get(fontId);
-    const rawName = font?.name || font?.fallbackName || '';
+    const rawName = decodeLegacyFontName(font?.name || font?.fallbackName || '');
     const bold = /(?:Bold|Heavy|Black|Semib?old)|(?:^|[-_ ])Bd(?: |$|-)/i.test(rawName);
-    const name = rawName
-      .replace(/^[A-Z]{6}\+/, '')
-      .trim();
+    const name = canonicalFontName(rawName);
     return {
       name: name || null,
       bold,
       key: fontId,
+      loadedName: font?.loadedName || null,
       data: font?.data instanceof Uint8Array ? font.data : null,
       mimetype: font?.mimetype || null
     };
   } catch (_) {
-    return { name: null, bold: false, key: fontId, data: null, mimetype: null };
+    return { name: null, bold: false, key: fontId, loadedName: null, data: null, mimetype: null };
   }
+}
+
+function textLooksUnreliable(value) {
+  return /[\uE000-\uF8FF\uFFFD\uFFF9-\uFFFB]/u.test(String(value || ''));
 }
 
 function appendRuns(output, incoming) {
@@ -203,6 +238,7 @@ function appendRuns(output, incoming) {
     const same = previous &&
       previous.font === run.font &&
       previous.fontKey === run.fontKey &&
+      previous.loadedName === run.loadedName &&
       Math.abs(previous.size - run.size) < 0.05 &&
       previous.color === run.color &&
       previous.bold === run.bold &&
@@ -225,6 +261,7 @@ function appendRuns(output, incoming) {
         text: run.text,
         font: run.font || '微软雅黑',
         fontKey: run.fontKey || null,
+        loadedName: run.loadedName || null,
         fontData: run.fontData || null,
         size: Math.round((run.size || 12) * 10) / 10,
         color: run.color || '#000000',
@@ -575,7 +612,7 @@ export function splitRawLine(rawLine) {
   return segments;
 }
 
-export async function extractContentPage(pdfDocument, pageNumber) {
+export async function extractContentPage(pdfDocument, pageNumber, options = {}) {
   const page = await pdfDocument.getPage(pageNumber);
   const pageViewport = page.getViewport({ scale: 1 });
   const textContent = await page.getTextContent();
@@ -674,10 +711,12 @@ export async function extractContentPage(pdfDocument, pageNumber) {
     });
   });
   const structureText = await collectStructureText(page, preliminaryFragments);
+  const unreliableFonts = unreliableFontNames(options.libDocument, pageNumber - 1);
   const allAppearanceItems = textContent.items.concat(structureText.items);
   const renderedAppearance = await analyzeRenderedTextItems(
     page, allAppearanceItems, itemOperations.map(indices => operations[indices?.[0]]?.color));
   const fragments = [];
+  let unreliableTextCount = 0;
   textContent.items.forEach((item, itemIndex) => {
     if (!item.str || !item.str.trim() || !horizontalItemIndices.has(itemIndex)) return;
     const size = Math.hypot(item.transform[2], item.transform[3]) ||
@@ -692,6 +731,11 @@ export async function extractContentPage(pdfDocument, pageNumber) {
     if (sourceRenderModes.length && sourceRenderModes.every(mode => mode === 3 || mode === 7)) return;
     const appearance = renderedAppearance[itemIndex];
     if (appearance && !appearance.visible) return;
+    const font = fontInfo(page, item.fontName);
+    if (textLooksUnreliable(item.str) || (font.name && unreliableFonts.has(font.name))) {
+      unreliableTextCount++;
+      return;
+    }
     fragments.push({
       x: item.transform[4],
       baseline: item.transform[5],
@@ -700,7 +744,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
       size,
       rotated: !isHorizontal(item),
       text: item.str,
-      font: { ...fontInfo(page, item.fontName), bold: fontInfo(page, item.fontName).bold || syntheticBold },
+      font: { ...font, bold: font.bold || syntheticBold },
       color: effectiveColor(operations[itemOperations[itemIndex]?.[0]], appearance) ||
         appearance?.color || '#000000',
       sourceOps: sourceOperations
@@ -753,6 +797,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
             text: ' ',
             font: fragment.font.name || '微软雅黑',
             fontKey: fragment.font.key,
+            loadedName: fragment.font.loadedName,
             fontData: fragment.font.data,
             size: fragment.size,
             color: fragment.color,
@@ -768,6 +813,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
           text: fragment.text,
           font: fragment.font.name || '微软雅黑',
           fontKey: fragment.font.key,
+          loadedName: fragment.font.loadedName,
           fontData: fragment.font.data,
           size: fragment.size,
           color: fragment.color,
@@ -799,6 +845,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
               text: ' ',
               font: fragment.font.name || '微软雅黑',
               fontKey: fragment.font.key,
+              loadedName: fragment.font.loadedName,
               fontData: fragment.font.data,
               size: fragment.size,
               color: fragment.color,
@@ -814,6 +861,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
             text: fragment.text,
             font: fragment.font.name || '微软雅黑',
             fontKey: fragment.font.key,
+            loadedName: fragment.font.loadedName,
             fontData: fragment.font.data,
             size: fragment.size,
             color: fragment.color,
@@ -864,6 +912,7 @@ export async function extractContentPage(pdfDocument, pageNumber) {
     width: pageViewport.width,
     height: pageViewport.height,
     sourceTextCount: textContent.items.length,
+    unreliableTextCount,
     structureFigureIds: structureText.ids,
     nativeBlocks: blocks,
     nativeLines: lines,
@@ -876,6 +925,15 @@ export function applySavedEdits(pageModel, savedEdits) {
   for (const block of [...(pageModel.nativeBlocks || pageModel.blocks || []), ...(pageModel.nativeLines || [])]) {
     const saved = editMap.get(block.id);
     if (saved?.engine !== 2 || !Array.isArray(saved.runs)) continue;
+    if (Number.isFinite(Number(saved.x))) block.x = Number(saved.x);
+    if (Number.isFinite(Number(saved.baseline))) block.baseline = Number(saved.baseline);
+    if (Number(saved.lineHeight) > 0) block.lineHeight = Number(saved.lineHeight);
+    if (Number(saved.size) > 0) block.size = Number(saved.size);
+    if (Number(saved.height) > 0) block.height = Number(saved.height);
+    if (Number(saved.maxWidth) > 0) block.width = Number(saved.maxWidth);
+    if (saved.alignment) block.alignment = saved.alignment;
+    if (Number.isInteger(saved.lineCount)) block.lineCount = saved.lineCount;
+    block.manualWidth = saved.manualWidth === true;
     block.runs = saved.runs.map(run => ({ ...run, sourceOps: [...block.sourceOps] }));
     block.text = block.runs.map(run => run.text).join('');
     block.sourceLineRuns = [block.runs.map(run => ({ ...run, sourceOps: [...run.sourceOps] }))];

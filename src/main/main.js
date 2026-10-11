@@ -6,6 +6,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { decryptPdf } = require('./pdf-decrypt');
 
 let mainWindow = null;
 const isMac = process.platform === 'darwin';
@@ -76,6 +77,15 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
+
+  const startupPdfPath = process.argv.slice(1).find(argument =>
+    /^[A-Za-z]:[\\/].+\.pdf$/i.test(argument) && fs.existsSync(argument)
+  );
+  if (startupPdfPath) {
+    const sendStartupPath = () => mainWindow.webContents.send('onyx:open-path', startupPdfPath);
+    if (mainWindow.webContents.isLoading()) mainWindow.webContents.once('did-finish-load', sendStartupPath);
+    else sendStartupPath();
+  }
 
   // 外部链接走系统浏览器，禁止在应用内打开
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -174,6 +184,14 @@ ipcMain.handle('onyx:read-pdf', async (_e, filePath) => {
   }
 });
 
+ipcMain.handle('onyx:decrypt-pdf', async (_event, bytes) => {
+  try {
+    return await decryptPdf(bytes);
+  } catch (error) {
+    return { ok: false, error: String(error && error.message || error) };
+  }
+});
+
 ipcMain.handle('onyx:read-font-file', async (_e, filePath) => {
   try {
     const normalized = String(filePath || '').toLowerCase().replace(/\//g, '\\');
@@ -257,4 +275,3 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (!isMac) app.quit();
 });
-

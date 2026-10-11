@@ -61,7 +61,7 @@ npm run dist
 
 工程结构：`src/main`（主进程 IPC）· `src/renderer`（UI 与阅览、批注、检索、工具模块）。
 
-构建与打包详见 [BUILD.md](BUILD.md)。Windows 安装包：`dist_out/OnyxPDF Setup 1.0.0.exe`（NSIS，含桌面/开始菜单快捷方式与卸载器）。
+构建与打包详见 [BUILD.md](BUILD.md)。Windows 安装包：`dist_out/OnyxPDF Setup 1.0.2.exe`（NSIS，含桌面/开始菜单快捷方式与卸载器）。
 
 ## 许可
 

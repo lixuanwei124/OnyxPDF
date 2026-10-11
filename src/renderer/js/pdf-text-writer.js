@@ -17,6 +17,8 @@ const FONT_FILES = {
     verdana: 'C:/Windows/Fonts/verdana.ttf',
     georgia: 'C:/Windows/Fonts/georgia.ttf',
     'courier new': 'C:/Windows/Fonts/cour.ttf'
+    ,
+    symbol: 'C:/Windows/Fonts/symbol.ttf'
   },
   bold: {
     '微软雅黑': 'C:/Windows/Fonts/msyhbd.ttc',
@@ -34,6 +36,8 @@ const FONT_FILES = {
     verdana: 'C:/Windows/Fonts/verdanab.ttf',
     georgia: 'C:/Windows/Fonts/georgiab.ttf',
     'courier new': 'C:/Windows/Fonts/courbd.ttf'
+    ,
+    symbol: 'C:/Windows/Fonts/symbol.ttf'
   }
 };
 
@@ -53,12 +57,14 @@ const FONT_ALIASES = {
     tahoma: ['tahoma'],
     verdana: ['verdana'],
     georgia: ['georgia'],
-    'courier new': ['courier new', 'couriernew', 'couriernewpsmt']
+    'courier new': ['courier new', 'couriernew', 'couriernewpsmt'],
+    symbol: ['symbol', 'symbolmt']
   }
 };
 
 const fontBytes = new Map();
 const embeddedFonts = new WeakMap();
+const subsetFonts = new WeakMap();
 
 function normalizeFont(value) {
   return String(value || '微软雅黑').split(',')[0].replace(/["']/g, '').trim().toLowerCase() || '微软雅黑';
@@ -76,7 +82,9 @@ function fontPath(value, bold) {
   const name = canonicalFont(value);
   const table = bold ? FONT_FILES.bold : FONT_FILES.regular;
   if (table[name]) return table[name];
-  if (/(arial|times|calibri|segoe|tahoma|verdana|georgia|courier)/.test(name)) return table.arial;
+  if (/(arial|helvetica|times|calibri|segoe|tahoma|verdana|georgia|courier)/.test(name)) {
+    return table.arial;
+  }
   return table['微软雅黑'];
 }
 
@@ -115,6 +123,57 @@ async function embedFont(pdfDocument, run) {
   return font;
 }
 
+function originalSubsetFont(run) {
+  if (!(run.fontData instanceof Uint8Array)) return null;
+  if (subsetFonts.has(run.fontData)) return subsetFonts.get(run.fontData);
+  let font = null;
+  try {
+    const parsed = window.fontkit.create(run.fontData);
+    font = typeof parsed.createSubset === 'function' ? parsed :
+      (parsed.fonts || []).find(item => typeof item.createSubset === 'function') ||
+      parsed.fonts?.[0] || parsed;
+  } catch (_) {
+    font = null;
+  }
+  subsetFonts.set(run.fontData, font);
+  return font;
+}
+
+export function originalFontSupportsText(run) {
+  if (!(run.fontData instanceof Uint8Array)) return false;
+  const font = originalSubsetFont(run);
+  if (!font || typeof font.hasGlyphForCodePoint !== 'function') return false;
+  return Array.from(run.text).every(character => {
+    const codePoint = character.codePointAt(0);
+    return character === '\n' || character === '\r' ||
+      font.hasGlyphForCodePoint(codePoint) !== false;
+  });
+}
+
+export function splitRunBySupportedGlyphs(run) {
+  if (!run.fontData || !run.text) return [run];
+  const font = originalSubsetFont(run);
+  if (!font || typeof font.hasGlyphForCodePoint !== 'function') {
+    return [{ ...run, fontKey: null, fontData: null, loadedName: null }];
+  }
+
+  const parts = [];
+  for (const character of Array.from(run.text)) {
+    const supported = character === '\n' || character === '\r' ||
+      font.hasGlyphForCodePoint(character.codePointAt(0)) !== false;
+    const last = parts[parts.length - 1];
+    if (last?.supported === supported) last.text += character;
+    else parts.push({ text: character, supported });
+  }
+
+  return parts.map(part => part.supported ? { ...run, text: part.text } : {
+    ...run,
+    text: part.text,
+    fontKey: null,
+    fontData: null,
+    loadedName: null
+  });
+}
 function runColor(value) {
   const source = String(value || '#000000').trim();
   const rgb = /rgba?\((\d+),\s*(\d+),\s*(\d+)/i.exec(source);
@@ -274,12 +333,18 @@ export async function drawContentBlock(page, block) {
   }
   const preparedRuns = [];
   for (const run of block.runs || []) {
-    if (!run.text) continue;
-    preparedRuns.push({
-      ...run,
-      font: await embedFont(page.doc, run),
-      size: Number(run.size) || block.size || 12
-    });
+    for (const supportedRun of splitRunBySupportedGlyphs(run)) {
+      if (!supportedRun.text) continue;
+      const family = normalizeFont(supportedRun.font);
+      const syntheticBold = !!supportedRun.bold && !(supportedRun.fontData instanceof Uint8Array) &&
+        fontPath(family, true) === fontPath(family, false);
+      preparedRuns.push({
+        ...supportedRun,
+        syntheticBold,
+        font: await embedFont(page.doc, supportedRun),
+        size: Number(supportedRun.size) || block.size || 12
+      });
+    }
   }
 
   const rotation = Math.abs(page.getRotation().angle) % 360;
@@ -289,8 +354,8 @@ export async function drawContentBlock(page, block) {
   const pageHeight = landscape ? pageSize.width : pageSize.height;
   const savedWidth = Number(block.maxWidth);
   const availableWidth = Math.max(pageWidth - block.x, 1);
-  const fixedWidth = block.manualWidth === true || Number(block.lineCount) > 1;
-  const metricTolerance = Math.max(1, (Number(block.size) || 12) * 0.15);
+  const fixedWidth = block.manualWidth === true || savedWidth > 0 || Number(block.lineCount) > 1;
+  const metricTolerance = 0;
   const maxWidth = fixedWidth && savedWidth > 0
     ? Math.max(Math.min(savedWidth, availableWidth), 1)
     : availableWidth;
@@ -304,7 +369,7 @@ export async function drawContentBlock(page, block) {
     const row = rows[rowIndex];
     const rowWidth = row.reduce((width, run) => width + run.font.widthOfTextAtSize(run.text, run.size), 0);
     let cursor = block.x;
-    const frameWidth = Number(block.width) || 0;
+    const frameWidth = Number(block.width) || savedWidth || 0;
     if (block.alignment === 'center' && frameWidth > 0) {
       cursor += (frameWidth - rowWidth) / 2;
     } else if (block.alignment === 'right' && frameWidth > 0) {
@@ -313,13 +378,32 @@ export async function drawContentBlock(page, block) {
     const baseline = startBaseline - rowIndex * rowHeight;
     for (const run of row) {
       if (!run.text) continue;
-      page.drawText(run.text, {
-        x: cursor,
-        y: baseline,
-        size: run.size,
-        font: run.font,
-        color: runColor(run.color)
-      });
+      if (run.syntheticBold) {
+        const pdfLib = window.PDFLib;
+        const strokeColor = runColor(run.color);
+        page.pushOperators(
+          pdfLib.pushGraphicsState(),
+          pdfLib.setLineWidth(Math.max(0.08, run.size * 0.022)),
+          pdfLib.setStrokingColor(strokeColor),
+          pdfLib.setTextRenderingMode(2)
+        );
+        page.drawText(run.text, {
+          x: cursor,
+          y: baseline,
+          size: run.size,
+          font: run.font,
+          color: strokeColor
+        });
+        page.pushOperators(pdfLib.popGraphicsState());
+      } else {
+        page.drawText(run.text, {
+          x: cursor,
+          y: baseline,
+          size: run.size,
+          font: run.font,
+          color: runColor(run.color)
+        });
+      }
       cursor += run.font.widthOfTextAtSize(run.text, run.size);
     }
   }

@@ -850,10 +850,14 @@ async function buildParagraphExportPages() {
     data: state.originalBytes.slice(0),
     cMapUrl: '../vendor/cmaps/',
     cMapPacked: true,
-    enableXfa: false
+    enableXfa: false,
+    fontExtraProperties: true
   }).promise;
   const embeddedFonts = await extractEmbeddedFonts(
-    state.originalBytes.slice(0), window.PDFLib, window.fontkit
+    (await contentEditor.editableSourceBytes()).slice(0), window.PDFLib, window.fontkit
+  );
+  const libDocument = await window.PDFLib.PDFDocument.load(
+    await contentEditor.editableSourceBytes(), { ignoreEncryption: true, updateMetadata: false }
   );
   const pages = [];
   let textFreeDocument = null;
@@ -861,7 +865,7 @@ async function buildParagraphExportPages() {
   try {
     for (let pageNumber = 1; pageNumber <= state.numPages; pageNumber++) {
       toast(`解析段落 ${pageNumber}/${state.numPages}…`);
-      const model = await extractContentPage(sourceDocument, pageNumber);
+      const model = await extractContentPage(sourceDocument, pageNumber, { libDocument });
       const originalExportLines = new Map(model.blocks.map(block => [
         block.id,
         (block.exportLines || []).map(line => ({ ...line }))
@@ -904,7 +908,8 @@ async function buildParagraphExportPages() {
       ),
       cMapUrl: '../vendor/cmaps/',
       cMapPacked: true,
-      enableXfa: false
+      enableXfa: false,
+      fontExtraProperties: true
     }).promise;
 
     for (const page of pages) {
@@ -1747,7 +1752,8 @@ async function buildPageImageExport(format) {
     data: (annotatedBytes || state.originalBytes).slice(0),
     cMapUrl: '../vendor/cmaps/',
     cMapPacked: true,
-    enableXfa: false
+    enableXfa: false,
+    fontExtraProperties: true
   }).promise;
   const images = [];
   try {

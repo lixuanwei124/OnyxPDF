@@ -3,7 +3,7 @@
 ## 本地构建 Windows 安装包（.exe）
 ```bash
 npm install
-npm run dist        # 产出 dist_out/OnyxPDF Setup 1.0.0.exe
+npm run dist        # 产出 dist_out/OnyxPDF Setup 1.0.2.exe
 ```
 
 ## 代码签名（可选）

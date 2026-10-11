@@ -57,7 +57,8 @@ export class Viewer {
       data,
       cMapUrl: '../vendor/cmaps/',
       cMapPacked: true,
-      enableXfa: false
+      enableXfa: false,
+      fontExtraProperties: true
     });
     this.doc = await task.promise;
 
@@ -83,7 +84,8 @@ export class Viewer {
       data: data.slice(0),
       cMapUrl: '../vendor/cmaps/',
       cMapPacked: true,
-      enableXfa: false
+      enableXfa: false,
+      fontExtraProperties: true
     });
     const nextDoc = await task.promise;
     if (!nextDoc.numPages) throw new Error('预览文档没有页面');

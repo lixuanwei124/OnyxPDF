@@ -7,8 +7,15 @@ import { applyContentEdits } from './pdf-text-writer.js';
 export async function exportAnnotatedPdf(originalBytes, annotationsList, suggestedName, contentEdits = []) {
   if (!window.PDFLib) throw new Error('pdf-lib 未加载');
   const { PDFDocument, rgb, StandardFonts } = window.PDFLib;
-  const pdfDoc = await PDFDocument.load(originalBytes);
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const pdfDoc = await PDFDocument.load(originalBytes, {
+    ignoreEncryption: true,
+    updateMetadata: false
+  });
+  let font = null;
+  const annotationFont = async () => {
+    if (!font) font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    return font;
+  };
   const pages = pdfDoc.getPages();
   let drawn = 0;
 
@@ -60,7 +67,7 @@ export async function exportAnnotatedPdf(originalBytes, annotationsList, suggest
       page.drawRectangle({ x: nx, y: ny, width: 12, height: 12, color: rgb(1, 0.69, 0.125), opacity: 0.95 });
       if (annotation.content) {
         page.drawText(annotation.content.replace(/\s+/g, ' ').slice(0, 46), {
-          x: nx + 16, y: ny + 3, size: 8, font,
+          x: nx + 16, y: ny + 3, size: 8, font: await annotationFont(),
           color: rgb(0.15, 0.15, 0.18), opacity: 0.85
         });
       }

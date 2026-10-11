@@ -1,7 +1,7 @@
 import * as pdfjsLib from '../vendor/pdf.min.mjs';
 import { clamp, toast, debounce } from './utils.js';
 import { extractContentPage, applySavedEdits, buildContentViews } from './content-model.js';
-import { applyContentEdits } from './pdf-text-writer.js';
+import { applyContentEdits, originalFontSupportsText, splitRunBySupportedGlyphs } from './pdf-text-writer.js';
 import { removeTextOperations } from './pdf-content-stream.js';
 import { exportAnnotatedPdf } from './exporter.js';
 
@@ -22,6 +22,15 @@ function lineHeightFromRatio(ratio, block) {
     Number(block?.lineHeight) ||
     (Number(block?.size) || 12) * 1.22;
   return clamp(ratio * base, 4, 192);
+}
+
+function quantile(values, ratio) {
+  if (!values.length) return 0;
+  const position = clamp(ratio, 0, 1) * (values.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const weight = position - lower;
+  return values[lower] * (1 - weight) + values[upper] * weight;
 }
 
 function fontFamilyName(value) {
@@ -117,11 +126,15 @@ function collectRuns(editor, fallback, scale = 1) {
   const push = (text, owner) => {
     if (!text) return;
     const style = owner.style || {};
+    const systemFont = owner._onyxSystemFont === true;
     const next = {
       text,
-      font: fontFamilyName(style.fontFamily || fallback.font),
+      font: systemFont
+        ? fontFamilyName(style.fontFamily || fallback.font)
+        : owner._onyxFontName ?? fontFamilyName(style.fontFamily || fallback.font),
       fontKey: owner._onyxFontKey ?? fallback.fontKey ?? null,
-      fontData: owner._onyxFontData ?? fallback.fontData ?? null,
+      loadedName: owner._onyxCssFont ?? fallback.loadedName ?? null,
+      fontData: systemFont ? null : owner._onyxFontData ?? fallback.fontData ?? null,
       size: Math.round((cssFontSizePt(style.fontSize, scale) || fallback.size) * 10) / 10,
       color: style.color || fallback.color || '#000000',
       bold: Number(style.fontWeight || (fallback.bold ? '700' : '400')) >= 600,
@@ -130,6 +143,8 @@ function collectRuns(editor, fallback, scale = 1) {
     };
     const previous = runs[runs.length - 1];
     if (previous && previous.fontKey === next.fontKey && previous.font === next.font &&
+      previous.loadedName === next.loadedName &&
+      previous.fontData === next.fontData &&
       Math.abs(previous.size - next.size) < 0.05 && previous.color === next.color &&
       previous.bold === next.bold && previous.italic === next.italic &&
       previous.underline === next.underline) {
@@ -152,8 +167,11 @@ function collectRuns(editor, fallback, scale = 1) {
     for (const node of element.childNodes) {
       const owner = {
         style: current,
+        _onyxFontName: element._onyxFontName,
         _onyxFontKey: element._onyxFontKey,
-        _onyxFontData: element._onyxFontData
+        _onyxFontData: element._onyxFontData,
+        _onyxCssFont: element._onyxCssFont,
+        _onyxSystemFont: element._onyxSystemFont
       };
       if (node.nodeType === Node.TEXT_NODE) push(node.textContent, owner);
       else if (node.nodeType === Node.ELEMENT_NODE) {
@@ -193,8 +211,9 @@ function applyFormatToSelection(editor, patch, fallback) {
 
     const parent = node.parentElement || editor;
     const current = {
-      font: fontFamilyName(parent.style.fontFamily || fallback.font),
+      font: parent._onyxFontName ?? fontFamilyName(parent.style.fontFamily || fallback.font),
       fontKey: parent._onyxFontKey ?? fallback.fontKey ?? null,
+      loadedName: parent._onyxCssFont ?? fallback.loadedName ?? null,
       fontData: parent._onyxFontData ?? fallback.fontData ?? null,
       size: cssFontSizePt(parent.style.fontSize, scale) || fallback.size,
       color: parent.style.color || fallback.color,
@@ -202,11 +221,22 @@ function applyFormatToSelection(editor, patch, fallback) {
       italic: String(parent.style.fontStyle || (fallback.italic ? 'italic' : 'normal')) === 'italic',
       underline: String(parent.style.textDecoration || '').includes('underline') || !!fallback.underline
     };
-    const makeSpan = (text, style, fontKey = parent._onyxFontKey ?? null, fontData = parent._onyxFontData ?? null) => {
+    const systemFont = parent._onyxSystemFont === true;
+    const makeSpan = (
+      text, style,
+      fontKey = parent._onyxFontKey ?? null,
+      fontData = parent._onyxFontData ?? null,
+      fontName = parent._onyxFontName ?? null,
+      cssFont = parent._onyxCssFont ?? null,
+      explicitSystemFont = systemFont
+    ) => {
       const span = document.createElement('span');
       span.style.cssText = style;
+      span._onyxFontName = fontName;
       span._onyxFontKey = fontKey;
       span._onyxFontData = fontData;
+      span._onyxCssFont = cssFont;
+      if (explicitSystemFont) span._onyxSystemFont = true;
       span.textContent = text;
       return span;
     };
@@ -216,12 +246,16 @@ function applyFormatToSelection(editor, patch, fallback) {
     }
     if (overlapEnd > overlapStart) {
       const patched = { ...current, ...patch, scale };
-      const preserveFont = !Object.prototype.hasOwnProperty.call(patch, 'font') && !Object.prototype.hasOwnProperty.call(patch, 'bold');
+      const preserveFont = !Object.prototype.hasOwnProperty.call(patch, 'font') &&
+        !Object.prototype.hasOwnProperty.call(patch, 'bold');
       fragment.appendChild(makeSpan(
         node.textContent.slice(overlapStart - nodeStart, overlapEnd - nodeStart),
         runStyle(patched),
         preserveFont ? current.fontKey : null,
-        preserveFont ? current.fontData : null
+        preserveFont ? current.fontData : null,
+        preserveFont ? current.font : null,
+        preserveFont ? current.loadedName : null,
+        preserveFont ? systemFont : true
       ));
     }
     if (nodeEnd > overlapEnd) {
@@ -255,6 +289,8 @@ export class ContentEditor {
     this.pendingImage = null;
     this.committing = false;
     this.originalDoc = null;
+    this.cachedSourceLibDocument = null;
+    this.sourceLibPromise = null;
     this.toolbar = null;
     this.modelPromises = new Map();
     this.fontPromises = new Map();
@@ -274,6 +310,8 @@ export class ContentEditor {
     this.enabled = false;
     this.models.clear();
     this.originalDoc = null;
+    this.cachedSourceLibDocument = null;
+    this.sourceLibPromise = null;
     this.modelPromises.clear();
     this.lineMetrics.clear();
     this.erasedBytes = null;
@@ -309,7 +347,8 @@ export class ContentEditor {
       data: bytes.slice(0),
       cMapUrl: '../vendor/cmaps/',
       cMapPacked: true,
-      enableXfa: false
+      enableXfa: false,
+      fontExtraProperties: true
     }).promise;
     return this.originalDoc;
   }
@@ -319,10 +358,14 @@ export class ContentEditor {
     if (this.erasedPromise) return await this.erasedPromise;
     this.erasedPromise = (async () => {
       const { PDFDocument } = window.PDFLib;
-      const pdfDocument = await PDFDocument.load(this.ctx.getOriginalBytes());
+      const sourceBytes = await this.editableSourceBytes();
+      const pdfDocument = await PDFDocument.load(sourceBytes, {
+        ignoreEncryption: true,
+        updateMetadata: false
+      });
       const originalDoc = await this.getOriginalDoc();
       for (let pageNumber = 1; pageNumber <= originalDoc.numPages; pageNumber++) {
-        removeTextOperations(pdfDocument, pageNumber - 1, [], { all: true });
+        removeTextOperations(pdfDocument, pageNumber - 1, [], { all: true, protectUnreliable: true });
       }
       const bytes = await pdfDocument.save();
       this.erasedBytes = bytes.slice(0);
@@ -332,6 +375,32 @@ export class ContentEditor {
       return await this.erasedPromise;
     } catch (error) {
       this.erasedPromise = null;
+      throw error;
+    }
+  }
+
+  async editableSourceBytes() {
+    const bytes = this.ctx.getOriginalBytes();
+    if (!window.onyx?.decryptPdf) return bytes;
+    const result = await window.onyx.decryptPdf(bytes);
+    if (!result?.ok) throw new Error(result?.error || 'PDF 解密失败');
+    return result.encrypted ? result.bytes : bytes;
+  }
+
+  async sourceLibDocument() {
+    if (this.cachedSourceLibDocument) return this.cachedSourceLibDocument;
+    if (!this.sourceLibPromise) {
+      const sourceBytes = await this.editableSourceBytes();
+      this.sourceLibPromise = window.PDFLib.PDFDocument.load(sourceBytes, {
+        ignoreEncryption: true,
+        updateMetadata: false
+      });
+    }
+    try {
+      this.cachedSourceLibDocument = await this.sourceLibPromise;
+      return this.cachedSourceLibDocument;
+    } catch (error) {
+      this.sourceLibPromise = null;
       throw error;
     }
   }
@@ -406,7 +475,10 @@ export class ContentEditor {
     const erasedPromise = this.buildErasedBytes();
     const modelPromise = this.ensurePageModel(currentPage);
     const erased = await erasedPromise;
-    await modelPromise;
+    const model = await modelPromise;
+    if (model?.unreliableTextCount) {
+      toast(`第 ${currentPage} 页有 ${model.unreliableTextCount} 处字体缺少 Unicode 映射，已保留原文不可编辑`);
+    }
     this.enabled = true;
     document.body.classList.add('content-editing');
     document.getElementById('btn-edit-mode')?.setAttribute('aria-pressed', 'true');
@@ -423,13 +495,22 @@ export class ContentEditor {
     const promise = (async () => {
       const originalDoc = await this.getOriginalDoc();
       if (pageNumber < 1 || pageNumber > originalDoc.numPages) return null;
-      const model = await extractContentPage(originalDoc, pageNumber);
+      const libDocument = await this.sourceLibDocument();
+      const model = await extractContentPage(originalDoc, pageNumber, { libDocument });
       model.mode = this.mode;
-      this.models.set(pageNumber, applySavedEdits(model, []));
+      const savedEdits = this.allEdits().filter(edit => edit.page === pageNumber);
+      this.models.set(pageNumber, applySavedEdits(model, savedEdits));
       return model;
     })();
     this.modelPromises.set(pageNumber, promise);
-    return promise;
+    try {
+      const model = await promise;
+      this.modelPromises.delete(pageNumber);
+      return model;
+    } catch (error) {
+      this.modelPromises.delete(pageNumber);
+      throw error;
+    }
   }
 
   activeBlocks(pageNumber) {
@@ -481,8 +562,10 @@ export class ContentEditor {
   }
 
   async registerEmbeddedFont(run) {
+    if (run.fontData && !originalFontSupportsText(run)) return run.font;
+    if (run.loadedName && document.fonts.check(`12px "${run.loadedName}"`)) return run.loadedName;
     if (!run.fontData || !run.fontKey) return run.font;
-    const name = `onyx-${run.fontKey}`;
+    const name = run.loadedName || `onyx-${run.fontKey}`;
     if (this.fontPromises.has(name)) return await this.fontPromises.get(name);
     const promise = (async () => {
       try {
@@ -529,38 +612,37 @@ export class ContentEditor {
         ? block.sourceLineRuns
         : [block.runs]);
     const runs = [];
+    let firstLineAscent = 0;
+    let maxContentHeight = 0;
     for (const [lineIndex, lineRuns] of sourceLines.entries()) {
       if (lineIndex) {
         const lineBreak = document.createElement('br');
         lineBreak.dataset.onyxSourceBreak = '1';
         runs.push(lineBreak);
       }
-      for (const run of lineRuns) {
-        const cssFont = await this.registerEmbeddedFont(run);
-        runs.push(await this.createRunSpan(run, scale, cssFont));
+      for (const sourceRun of lineRuns) {
+        for (const run of splitRunBySupportedGlyphs(sourceRun)) {
+          const cssFont = await this.registerEmbeddedFont(run);
+          const metrics = this.previewLineMetrics(run, `"${cssFont}","${fontFamilyName(run.font)}","Microsoft YaHei",sans-serif`, scale);
+          if (lineIndex === 0) firstLineAscent = Math.max(firstLineAscent, metrics.ascent);
+          maxContentHeight = Math.max(maxContentHeight, metrics.contentHeight);
+          runs.push(await this.createRunSpan(run, scale, cssFont));
+        }
       }
     }
     if (runs.length) element.append(...runs);
     else element.textContent = block.text || '';
 
-    if (block.lineCount === 1 && !element.querySelector('br[data-onyx-source-break]')) {
-      const naturalWidth = this.measureNaturalWidth(element);
-      if (naturalWidth + 2 > width + 0.05) {
-        width = clamp(naturalWidth + 2, width, availableWidth);
-        block.width = width;
-        element.style.width = `${width * scale}px`;
-        element._widthPt = width;
-      }
+    const naturalWidth = this.measureNaturalWidth(element);
+    if (naturalWidth + 2 > width + 0.05) {
+      width = clamp(naturalWidth + 2, width, availableWidth);
+      block.width = width;
+      element.style.width = `${width * scale}px`;
+      element._widthPt = width;
     }
 
-    const metricRun = (sourceLines[0] || [block.runs[0] || block])[0];
-    if (metricRun) {
-      const metricCssFont = `"${await this.registerEmbeddedFont(metricRun)}","${fontFamilyName(metricRun.font)}","Microsoft YaHei",sans-serif`;
-      const metrics = this.previewLineMetrics(metricRun, metricCssFont, scale);
-      block.previewAscent = metrics.ascent;
-      block.previewContentHeight = metrics.contentHeight;
-      element.style.top = `${this.blockTopPt(block, model) * scale}px`;
-    }
+    if (firstLineAscent) block.previewAscent = firstLineAscent;
+    if (maxContentHeight) block.previewContentHeight = maxContentHeight;
 
     element.addEventListener('pointerdown', () => this.selectBlock(element));
     element.addEventListener('keydown', event => {
@@ -579,7 +661,34 @@ export class ContentEditor {
     });
     element.addEventListener('input', () => {
       element.dataset.changed = '1';
-      this.expandSingleLinePreview(element);
+      this._syncToolbarIdle();
+    });
+    element.addEventListener('beforeinput', event => {
+      if (event.inputType !== 'insertText' || !event.data) return;
+      const selection = window.getSelection();
+      if (!selection.rangeCount) return;
+      const range = selection.getRangeAt(0);
+      if (!element.contains(range.commonAncestorContainer)) return;
+      const span = this.caretRunSpan(element, range);
+      if (!span) return;
+      event.preventDefault();
+      if (!range.collapsed) range.deleteContents();
+      const selectionAfterInsert = window.getSelection();
+      const currentRange = selection.rangeCount ? selection.getRangeAt(0) : range;
+      let textNode = currentRange.startContainer;
+      let offset = currentRange.startOffset;
+      if (textNode.nodeType !== Node.TEXT_NODE || !span.contains(textNode)) {
+        textNode = document.createTextNode('');
+        span.appendChild(textNode);
+        offset = 0;
+      }
+      textNode.insertData(offset, event.data);
+      const nextRange = document.createRange();
+      nextRange.setStart(textNode, offset + event.data.length);
+      nextRange.collapse(true);
+      selectionAfterInsert.removeAllRanges();
+      selectionAfterInsert.addRange(nextRange);
+      element.dataset.changed = '1';
       this._syncToolbarIdle();
     });
     element.addEventListener('paste', event => {
@@ -600,10 +709,29 @@ export class ContentEditor {
   async createRunSpan(run, scale, cssFont) {
     const span = document.createElement('span');
     span.style.cssText = runStyle({ ...run, scale, cssFontFamily: `"${cssFont}","${fontFamilyName(run.font)}","Microsoft YaHei",sans-serif` });
+    span._onyxFontName = run.font || null;
     span._onyxFontKey = run.fontKey || null;
     span._onyxFontData = run.fontData || null;
+    span._onyxCssFont = run.loadedName || cssFont || null;
+    span._onyxSystemFont = !run.fontData && !run.fontKey;
     span.textContent = run.text;
     return span;
+  }
+
+  caretRunSpan(element, range) {
+    if (range.startContainer.nodeType === Node.TEXT_NODE) {
+      const span = range.startContainer.parentElement;
+      return span && span !== element && element.contains(span) &&
+        !span.classList.contains('content-frame-handle') ? span : null;
+    }
+    if (range.startContainer !== element) return null;
+    const previous = range.startContainer.childNodes[range.startOffset - 1];
+    const next = range.startContainer.childNodes[range.startOffset];
+    for (const node of [previous, next]) {
+      if (node?.nodeType === Node.ELEMENT_NODE && node.tagName === 'SPAN' &&
+        !node.classList.contains('content-frame-handle')) return node;
+    }
+    return null;
   }
 
   selectBlock(element, focus = true) {
@@ -988,6 +1116,28 @@ export class ContentEditor {
     return model.height - block.baseline - ascent - leading;
   }
 
+  contentAlignmentFrame(block, pageNumber) {
+    const model = this.models.get(pageNumber);
+    if (!model) return null;
+    const blocks = this.activeBlocks(pageNumber).filter(candidate =>
+      candidate.text && Number(candidate.width) >= 12 && !candidate.patch);
+    let left;
+    let right;
+    if (blocks.length >= 5) {
+      left = quantile(blocks.map(candidate => candidate.x).sort((a, b) => a - b), 0.12);
+      right = quantile(blocks.map(candidate => candidate.x + candidate.width)
+        .sort((a, b) => a - b), 0.88);
+    } else {
+      left = model.width * 0.06;
+      right = model.width * 0.94;
+    }
+    left = Math.min(left, block.x);
+    right = Math.max(right, block.x + block.width);
+    left = clamp(left, 0, Math.max(0, model.width - 12));
+    right = clamp(right, left + Math.max(block.width, 12), model.width);
+    return { x: left, width: right - left };
+  }
+
   formatSelection(patch) {
     const element = this.activeElement();
     if (!element) {
@@ -996,10 +1146,24 @@ export class ContentEditor {
     }
     if (patch.alignment) {
       const block = this.blockFor(element);
-      if (block) block.alignment = patch.alignment;
+      if (block) {
+        block.alignment = patch.alignment;
+        if (element.dataset.resized !== '1' && block.manualWidth !== true) {
+          const frame = this.contentAlignmentFrame(block, Number(element.dataset.page));
+          if (frame) {
+            block.x = frame.x;
+            block.width = frame.width;
+            this.applyBlockGeometry(element, block, this.models.get(Number(element.dataset.page)),
+              element._scale || this.ctx.viewer.scale);
+          }
+        }
+      }
       element.style.textAlign = patch.alignment;
       element.dataset.changed = '1';
       element.focus({ preventScroll: true });
+      if (this.selectedRange?.element === element && this.selectedRange.end > this.selectedRange.start) {
+        restoreSelection(element, this.selectedRange);
+      }
       this.syncToolbar();
       return;
     }
@@ -1049,7 +1213,8 @@ export class ContentEditor {
     const styles = nodes.map(node => {
       const style = node.parentElement?.style || element.style;
       return {
-        font: toolbarFontFamilyName(style.fontFamily || getComputedStyle(node.parentElement || element).fontFamily),
+        font: toolbarFontFamilyName(node.parentElement?._onyxFontName ||
+          style.fontFamily || getComputedStyle(node.parentElement || element).fontFamily),
         size: Math.round((cssFontSizePt(style.fontSize, element._scale || this.ctx.viewer.scale) || 12) * 10) / 10,
         color: style.color || '',
         bold: Number(style.fontWeight || 400) >= 600
@@ -1108,9 +1273,10 @@ export class ContentEditor {
       const model = this.models.get(pageNumber);
       const block = this.blockFor(element);
       if (!model || !block) continue;
-      const runs = collectRuns(element, {
+      const collectedRuns = collectRuns(element, {
         font: block.runs[0]?.font || block.font || '微软雅黑',
         fontKey: block.runs[0]?.fontKey || block.fontKey || null,
+        loadedName: block.runs[0]?.loadedName || block.loadedName || null,
         fontData: block.runs[0]?.fontData || block.fontData || null,
         size: block.runs[0]?.size || block.size || 12,
         color: block.runs[0]?.color || block.color || '#000000',
@@ -1118,9 +1284,11 @@ export class ContentEditor {
         italic: block.runs[0]?.italic ?? false,
         underline: block.runs[0]?.underline ?? false
       }, element._scale || this.ctx.viewer.scale);
+      const runs = collectedRuns.flatMap(run => splitRunBySupportedGlyphs(run));
       if (!runs.some(run => run.text)) continue;
       block.runs = runs.map(run => ({ ...run }));
       block.text = runs.map(run => run.text).join('');
+      block.sourceLineRuns = [block.runs.map(run => ({ ...run }))];
       block.width = element._widthPt || block.width;
       block.height = element._heightPt || block.height;
       const manualWidth = element.dataset.resized === '1';
@@ -1193,6 +1361,8 @@ export class ContentEditor {
       await this.swapPdfDocument(bytes, currentPage);
       await this.ctx.viewer.doc.cleanup();
       this.edits = new Map(pageEdits.map(edit => [edit.blockKey, edit]));
+      this.models.clear();
+      this.modelPromises.clear();
       this.finishUi();
       toast(`已完成 ${changedCount + this.allImages().length} 个内容修改`);
     } catch (error) {
