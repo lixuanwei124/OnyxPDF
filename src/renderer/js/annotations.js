@@ -417,7 +417,8 @@ export class Annotations {
       if (!originalBytes) throw new Error('原始 PDF 不可用');
       this._originalDocPromise = pdfjsLib.getDocument({
         data: originalBytes.slice(0),
-        cMapUrl: '../vendor/cmaps/',
+        cMapUrl: './vendor/cmaps/',
+        standardFontDataUrl: './vendor/standard_fonts/',
         cMapPacked: true,
         enableXfa: false
       }).promise.then(doc => {

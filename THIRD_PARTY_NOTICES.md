@@ -13,6 +13,7 @@ OnyxPDF incorporates the following third-party components:
 | http-proxy-agent | 9.1.0 | MIT | https://github.com/TooTallNate/proxy-agents |
 | Electron | 33.4.11 | MIT | https://github.com/electron/electron |
 | electron-builder (build time) | 25.1.8 | MIT | https://github.com/electron-userland/electron-builder |
+| pdf.js standard fonts | same as pdf.js resources | BSD 3-Clause / SIL OFL 1.1 | https://mozilla.github.io/pdf.js/ |
 
 ## Notes
 
@@ -23,6 +24,10 @@ OnyxPDF incorporates the following third-party components:
 - CMap resources under `src/renderer/vendor/cmaps/` are provided by the
   pdf.js project (Copyright Adobe). Their redistribution license is included
   at `src/renderer/vendor/cmaps/LICENSE`.
+- Standard font resources under `src/renderer/vendor/standard_fonts/` are
+  bundled from pdf.js. Their licenses are included in the same directory:
+  `LICENSE_FOXIT` (PDFium authors, BSD 3-Clause) and `LICENSE_LIBERATION`
+  (Liberation Sans, SIL Open Font License 1.1).
 - The Apache-2.0 license text ships with `node_modules/pdfjs-dist/LICENSE`
   and is included in packaged builds that bundle the pdfjs-dist package.
 - Where a bundled vendor file does not carry the full license text of its

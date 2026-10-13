@@ -10,4 +10,6 @@
 *.ico binary
 *.png binary
 *.bcmap binary
+*.pfb binary
+*.ttf binary
 *.exe binary

@@ -55,7 +55,8 @@ export class Viewer {
     this.fileInfo = fileInfo;
     const task = this.ctx.pdfjsLib.getDocument({
       data,
-      cMapUrl: '../vendor/cmaps/',
+      cMapUrl: './vendor/cmaps/',
+      standardFontDataUrl: './vendor/standard_fonts/',
       cMapPacked: true,
       enableXfa: false,
       fontExtraProperties: true
@@ -82,7 +83,8 @@ export class Viewer {
   async replaceDocument(data, restorePage = 1) {
     const task = this.ctx.pdfjsLib.getDocument({
       data: data.slice(0),
-      cMapUrl: '../vendor/cmaps/',
+      cMapUrl: './vendor/cmaps/',
+      standardFontDataUrl: './vendor/standard_fonts/',
       cMapPacked: true,
       enableXfa: false,
       fontExtraProperties: true

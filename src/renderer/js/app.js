@@ -21,7 +21,7 @@ import { extractContentPage, applySavedEdits } from './content-model.js';
 import { removeTextOperations } from './pdf-content-stream.js';
 import { extractEmbeddedFonts } from './embedded-fonts.js';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = '../vendor/pdf.worker.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 
 /* ══════════ 全局状态 ══════════ */
 const state = {
@@ -848,7 +848,8 @@ async function buildParagraphExportPages() {
 
   const sourceDocument = await pdfjsLib.getDocument({
     data: state.originalBytes.slice(0),
-    cMapUrl: '../vendor/cmaps/',
+    cMapUrl: './vendor/cmaps/',
+    standardFontDataUrl: './vendor/standard_fonts/',
     cMapPacked: true,
     enableXfa: false,
     fontExtraProperties: true
@@ -906,7 +907,8 @@ async function buildParagraphExportPages() {
       data: await createTextFreeDocumentBytes(
         state.originalBytes.slice(0), sourceOperationsByPage
       ),
-      cMapUrl: '../vendor/cmaps/',
+      cMapUrl: './vendor/cmaps/',
+      standardFontDataUrl: './vendor/standard_fonts/',
       cMapPacked: true,
       enableXfa: false,
       fontExtraProperties: true
@@ -1750,7 +1752,8 @@ async function buildPageImageExport(format) {
   const annotatedBytes = await buildAnnotatedBytes();
   const sourceDocument = await pdfjsLib.getDocument({
     data: (annotatedBytes || state.originalBytes).slice(0),
-    cMapUrl: '../vendor/cmaps/',
+    cMapUrl: './vendor/cmaps/',
+    standardFontDataUrl: './vendor/standard_fonts/',
     cMapPacked: true,
     enableXfa: false,
     fontExtraProperties: true

@@ -345,7 +345,8 @@ export class ContentEditor {
     if (!bytes) throw new Error('原始 PDF 不可用');
     this.originalDoc = await pdfjsLib.getDocument({
       data: bytes.slice(0),
-      cMapUrl: '../vendor/cmaps/',
+      cMapUrl: './vendor/cmaps/',
+      standardFontDataUrl: './vendor/standard_fonts/',
       cMapPacked: true,
       enableXfa: false,
       fontExtraProperties: true
